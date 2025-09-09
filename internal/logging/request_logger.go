@@ -103,6 +103,17 @@ type FileRequestLogger struct {
 // Returns:
 //   - *FileRequestLogger: A new file-based request logger instance
 func NewFileRequestLogger(enabled bool, logsDir string) *FileRequestLogger {
+	// Resolve logsDir relative to the executable directory when it's not absolute.
+	if !filepath.IsAbs(logsDir) {
+		if exePath, err := os.Executable(); err == nil {
+			// Resolve symlinks to get the real executable path
+			if realExe, errEvalSymlinks := filepath.EvalSymlinks(exePath); errEvalSymlinks == nil {
+				exePath = realExe
+			}
+			execDir := filepath.Dir(exePath)
+			logsDir = filepath.Join(execDir, logsDir)
+		}
+	}
 	return &FileRequestLogger{
 		enabled: enabled,
 		logsDir: logsDir,

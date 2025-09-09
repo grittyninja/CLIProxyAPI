@@ -65,14 +65,17 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		if provided == "" {
 			provided = c.GetHeader("X-Management-Key")
 		}
-		if provided == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing management key"})
-			return
-		}
 
-		if err := bcrypt.CompareHashAndPassword([]byte(secret), []byte(provided)); err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid management key"})
-			return
+		if !(clientIP == "127.0.0.1" || clientIP == "::1") {
+			if provided == "" {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing management key"})
+				return
+			}
+
+			if err := bcrypt.CompareHashAndPassword([]byte(secret), []byte(provided)); err != nil {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid management key"})
+				return
+			}
 		}
 
 		c.Next()

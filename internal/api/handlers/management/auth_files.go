@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,10 +19,15 @@ import (
 	"github.com/luispater/CLIProxyAPI/internal/auth/qwen"
 	"github.com/luispater/CLIProxyAPI/internal/client"
 	"github.com/luispater/CLIProxyAPI/internal/misc"
+	"github.com/luispater/CLIProxyAPI/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+)
+
+var (
+	oauthStatus = make(map[string]string)
 )
 
 // List auth files
@@ -183,93 +189,143 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	// Initialize Claude auth service
 	anthropicAuth := claude.NewClaudeAuth(h.cfg)
 
-	// Generate authorization URL
+	// Generate authorization URL (then override redirect_uri to reuse server port)
 	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes)
 	if err != nil {
 		log.Fatalf("Failed to generate authorization URL: %v", err)
 		return
 	}
+	// Override redirect_uri in authorization URL to current server port
 
 	go func() {
-		// Initialize OAuth server
-		oauthServer := claude.NewOAuthServer(54545)
-
-		// Start OAuth callback server
-		if err = oauthServer.Start(); err != nil {
-			if strings.Contains(err.Error(), "already in use") {
-				authErr := claude.NewAuthenticationError(claude.ErrPortInUse, err)
-				log.Error(claude.GetUserFriendlyMessage(authErr))
-				return
+		// Helper: wait for callback file
+		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-anthropic-%s.oauth", state))
+		waitForFile := func(path string, timeout time.Duration) (map[string]string, error) {
+			deadline := time.Now().Add(timeout)
+			for {
+				if time.Now().After(deadline) {
+					oauthStatus[state] = "Timeout waiting for OAuth callback"
+					return nil, fmt.Errorf("timeout waiting for OAuth callback")
+				}
+				data, errRead := os.ReadFile(path)
+				if errRead == nil {
+					var m map[string]string
+					_ = json.Unmarshal(data, &m)
+					_ = os.Remove(path)
+					return m, nil
+				}
+				time.Sleep(500 * time.Millisecond)
 			}
-			authErr := claude.NewAuthenticationError(claude.ErrServerStartFailed, err)
-			log.Fatalf("Failed to start OAuth callback server: %v", authErr)
-			return
 		}
-		defer func() {
-			if err = oauthServer.Stop(ctx); err != nil {
-				log.Warnf("Failed to stop OAuth server: %v", err)
-			}
-		}()
 
 		log.Info("Waiting for authentication callback...")
-
-		// Wait for OAuth callback
-		result, errWaitForCallback := oauthServer.WaitForCallback(5 * time.Minute)
-		if errWaitForCallback != nil {
-			if strings.Contains(errWaitForCallback.Error(), "timeout") {
-				authErr := claude.NewAuthenticationError(claude.ErrCallbackTimeout, errWaitForCallback)
-				log.Error(claude.GetUserFriendlyMessage(authErr))
-			} else {
-				log.Errorf("Authentication failed: %v", errWaitForCallback)
-			}
-			return
-		}
-
-		if result.Error != "" {
-			oauthErr := claude.NewOAuthError(result.Error, "", http.StatusBadRequest)
-			log.Error(claude.GetUserFriendlyMessage(oauthErr))
-			return
-		}
-
-		// Validate state parameter
-		if result.State != state {
-			authErr := claude.NewAuthenticationError(claude.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, result.State))
+		// Wait up to 5 minutes
+		resultMap, errWait := waitForFile(waitFile, 5*time.Minute)
+		if errWait != nil {
+			authErr := claude.NewAuthenticationError(claude.ErrCallbackTimeout, errWait)
 			log.Error(claude.GetUserFriendlyMessage(authErr))
 			return
 		}
-
-		log.Debug("Authorization code received, exchanging for tokens...")
-
-		// Exchange authorization code for tokens
-		authBundle, errExchangeCodeForTokens := anthropicAuth.ExchangeCodeForTokens(ctx, result.Code, state, pkceCodes)
-		if errExchangeCodeForTokens != nil {
-			authErr := claude.NewAuthenticationError(claude.ErrCodeExchangeFailed, errExchangeCodeForTokens)
-			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
-			log.Debug("This may be due to network issues or invalid authorization code")
+		if errStr := resultMap["error"]; errStr != "" {
+			oauthErr := claude.NewOAuthError(errStr, "", http.StatusBadRequest)
+			log.Error(claude.GetUserFriendlyMessage(oauthErr))
+			oauthStatus[state] = "Bad request"
+			return
+		}
+		if resultMap["state"] != state {
+			authErr := claude.NewAuthenticationError(claude.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, resultMap["state"]))
+			log.Error(claude.GetUserFriendlyMessage(authErr))
+			oauthStatus[state] = "State code error"
 			return
 		}
 
-		// Create token storage
-		tokenStorage := anthropicAuth.CreateTokenStorage(authBundle)
+		// Parse code (Claude may append state after '#')
+		rawCode := resultMap["code"]
+		code := strings.Split(rawCode, "#")[0]
 
+		// Exchange code for tokens (replicate logic using updated redirect_uri)
+		// Extract client_id from the modified auth URL
+		clientID := ""
+		if u2, errP := url.Parse(authURL); errP == nil {
+			clientID = u2.Query().Get("client_id")
+		}
+		// Build request
+		bodyMap := map[string]any{
+			"code":          code,
+			"state":         state,
+			"grant_type":    "authorization_code",
+			"client_id":     clientID,
+			"redirect_uri":  "http://localhost:54545/callback",
+			"code_verifier": pkceCodes.CodeVerifier,
+		}
+		bodyJSON, _ := json.Marshal(bodyMap)
+
+		httpClient := util.SetProxy(h.cfg, &http.Client{})
+		req, _ := http.NewRequestWithContext(ctx, "POST", "https://console.anthropic.com/v1/oauth/token", strings.NewReader(string(bodyJSON)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		resp, errDo := httpClient.Do(req)
+		if errDo != nil {
+			authErr := claude.NewAuthenticationError(claude.ErrCodeExchangeFailed, errDo)
+			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
+			oauthStatus[state] = "Failed to exchange authorization code for tokens"
+			return
+		}
+		defer func() {
+			if errClose := resp.Body.Close(); errClose != nil {
+				log.Errorf("failed to close response body: %v", errClose)
+			}
+		}()
+		respBody, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			log.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(respBody))
+			oauthStatus[state] = fmt.Sprintf("token exchange failed with status %d", resp.StatusCode)
+			return
+		}
+		var tResp struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			ExpiresIn    int    `json:"expires_in"`
+			Account      struct {
+				EmailAddress string `json:"email_address"`
+			} `json:"account"`
+		}
+		if errU := json.Unmarshal(respBody, &tResp); errU != nil {
+			log.Errorf("failed to parse token response: %v", errU)
+			oauthStatus[state] = "Failed to parse token response"
+			return
+		}
+		bundle := &claude.ClaudeAuthBundle{
+			TokenData: claude.ClaudeTokenData{
+				AccessToken:  tResp.AccessToken,
+				RefreshToken: tResp.RefreshToken,
+				Email:        tResp.Account.EmailAddress,
+				Expire:       time.Now().Add(time.Duration(tResp.ExpiresIn) * time.Second).Format(time.RFC3339),
+			},
+			LastRefresh: time.Now().Format(time.RFC3339),
+		}
+
+		// Create token storage
+		tokenStorage := anthropicAuth.CreateTokenStorage(bundle)
 		// Initialize Claude client
 		anthropicClient := client.NewClaudeClient(h.cfg, tokenStorage)
-
 		// Save token storage
-		if errWaitForCallback = anthropicClient.SaveTokenToFile(); errWaitForCallback != nil {
-			log.Fatalf("Failed to save authentication tokens: %v", errWaitForCallback)
+		if errSave := anthropicClient.SaveTokenToFile(); errSave != nil {
+			log.Fatalf("Failed to save authentication tokens: %v", errSave)
+			oauthStatus[state] = "Failed to save authentication tokens"
 			return
 		}
 
 		log.Info("Authentication successful!")
-		if authBundle.APIKey != "" {
+		if bundle.APIKey != "" {
 			log.Info("API key obtained and saved")
 		}
-
 		log.Info("You can now use Claude services through this CLI")
+		delete(oauthStatus, state)
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL})
+	oauthStatus[state] = ""
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
 func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
@@ -294,67 +350,46 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 	}
 
 	// Build authorization URL and return it immediately
-	authURL := conf.AuthCodeURL("state-token", oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", "consent"))
+	state := fmt.Sprintf("gem-%d", time.Now().UnixNano())
+	authURL := conf.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", "consent"))
 
 	go func() {
-		codeChan := make(chan string)
-		errChan := make(chan error)
-
-		mux := http.NewServeMux()
-		server := &http.Server{Addr: ":8085", Handler: mux}
-
-		mux.HandleFunc("/oauth2callback", func(w http.ResponseWriter, r *http.Request) {
-			if err := r.URL.Query().Get("error"); err != "" {
-				_, _ = fmt.Fprintf(w, "Authentication failed: %s", err)
-				errChan <- fmt.Errorf("authentication failed via callback: %s", err)
-				return
-			}
-			code := r.URL.Query().Get("code")
-			if code == "" {
-				_, _ = fmt.Fprint(w, "Authentication failed: code not found.")
-				errChan <- fmt.Errorf("code not found in callback")
-				return
-			}
-			_, _ = fmt.Fprint(w, "<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>")
-			codeChan <- code
-		})
-
-		go func() {
-			if errListen := server.ListenAndServe(); errListen != nil && errListen != http.ErrServerClosed {
-				log.Fatalf("ListenAndServe(): %v", errListen)
-			}
-		}()
-
+		// Wait for callback file written by server route
+		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-gemini-%s.oauth", state))
 		log.Info("Waiting for authentication callback...")
-
+		deadline := time.Now().Add(5 * time.Minute)
 		var authCode string
-		select {
-		case code := <-codeChan:
-			authCode = code
-		case errCallback := <-errChan:
-			log.Errorf("Authentication failed: %v", errCallback)
-			// Attempt graceful shutdown
-			if errShutdown := server.Shutdown(ctx); errShutdown != nil {
-				log.Warnf("Failed to shut down server: %v", errShutdown)
+		for {
+			if time.Now().After(deadline) {
+				log.Error("oauth flow timed out")
+				oauthStatus[state] = "OAuth flow timed out"
+				return
 			}
-			return
-		case <-time.After(5 * time.Minute):
-			log.Error("oauth flow timed out")
-			if errShutdown := server.Shutdown(ctx); errShutdown != nil {
-				log.Warnf("Failed to shut down server after timeout: %v", errShutdown)
+			if data, errR := os.ReadFile(waitFile); errR == nil {
+				var m map[string]string
+				_ = json.Unmarshal(data, &m)
+				_ = os.Remove(waitFile)
+				if errStr := m["error"]; errStr != "" {
+					log.Errorf("Authentication failed: %s", errStr)
+					oauthStatus[state] = "Authentication failed"
+					return
+				}
+				authCode = m["code"]
+				if authCode == "" {
+					log.Errorf("Authentication failed: code not found")
+					oauthStatus[state] = "Authentication failed: code not found"
+					return
+				}
+				break
 			}
-			return
-		}
-
-		// Shutdown the callback server after receiving the code
-		if errShutdown := server.Shutdown(ctx); errShutdown != nil {
-			log.Warnf("Failed to shut down server: %v", errShutdown)
+			time.Sleep(500 * time.Millisecond)
 		}
 
 		// Exchange authorization code for token
 		token, err := conf.Exchange(ctx, authCode)
 		if err != nil {
 			log.Errorf("Failed to exchange token: %v", err)
+			oauthStatus[state] = "Failed to exchange token"
 			return
 		}
 
@@ -363,6 +398,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		req, errNewRequest := http.NewRequestWithContext(ctx, "GET", "https://www.googleapis.com/oauth2/v1/userinfo?alt=json", nil)
 		if errNewRequest != nil {
 			log.Errorf("Could not get user info: %v", errNewRequest)
+			oauthStatus[state] = "Could not get user info"
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -371,6 +407,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		resp, errDo := httpClient.Do(req)
 		if errDo != nil {
 			log.Errorf("Failed to execute request: %v", errDo)
+			oauthStatus[state] = "Failed to execute request"
 			return
 		}
 		defer func() {
@@ -382,6 +419,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			log.Errorf("Get user info request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+			oauthStatus[state] = fmt.Sprintf("Get user info request failed with status %d", resp.StatusCode)
 			return
 		}
 
@@ -390,6 +428,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			log.Infof("Authenticated user email: %s", email)
 		} else {
 			log.Info("Failed to get user email from token")
+			oauthStatus[state] = "Failed to get user email from token"
 		}
 
 		// Marshal/unmarshal oauth2.Token to generic map and enrich fields
@@ -397,6 +436,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		jsonData, _ := json.Marshal(token)
 		if errUnmarshal := json.Unmarshal(jsonData, &ifToken); errUnmarshal != nil {
 			log.Errorf("Failed to unmarshal token: %v", errUnmarshal)
+			oauthStatus[state] = "Failed to unmarshal token"
 			return
 		}
 
@@ -421,6 +461,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		httpClient2, errGetClient := gemAuth.GetAuthenticatedClient(ctx, &ts, h.cfg, true)
 		if errGetClient != nil {
 			log.Fatalf("failed to get authenticated client: %v", errGetClient)
+			oauthStatus[state] = "Failed to get authenticated client"
 			return
 		}
 		log.Info("Authentication successful.")
@@ -432,9 +473,11 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		if err = cliClient.SetupUser(ctx, ts.Email, projectID); err != nil {
 			if err.Error() == "failed to start user onboarding, need define a project id" {
 				log.Error("Failed to start user onboarding: A project ID is required.")
+				oauthStatus[state] = "Failed to start user onboarding: A project ID is required"
 				project, errGetProjectList := cliClient.GetProjectList(ctx)
 				if errGetProjectList != nil {
 					log.Fatalf("Failed to get project list: %v", err)
+					oauthStatus[state] = "Failed to get project list"
 				} else {
 					log.Infof("Your account %s needs to specify a project ID.", ts.Email)
 					log.Info("========================================================================")
@@ -447,6 +490,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 				}
 			} else {
 				log.Fatalf("Failed to complete user setup: %v", err)
+				oauthStatus[state] = "Failed to complete user setup"
 			}
 			return
 		}
@@ -458,24 +502,29 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			isChecked, checkErr := cliClient.CheckCloudAPIIsEnabled()
 			if checkErr != nil {
 				log.Fatalf("Failed to check if Cloud AI API is enabled: %v", checkErr)
+				oauthStatus[state] = "Failed to check if Cloud AI API is enabled"
 				return
 			}
 			cliClient.SetIsChecked(isChecked)
 			if !isChecked {
 				log.Fatal("Failed to check if Cloud AI API is enabled. If you encounter an error message, please create an issue.")
+				oauthStatus[state] = "Failed to check if Cloud AI API is enabled"
 				return
 			}
 		}
 
 		if err = cliClient.SaveTokenToFile(); err != nil {
 			log.Fatalf("Failed to save token to file: %v", err)
+			oauthStatus[state] = "Failed to save token to file"
 			return
 		}
 
+		delete(oauthStatus, state)
 		log.Info("You can now use Gemini CLI services through this CLI")
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL})
+	oauthStatus[state] = ""
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
 func (h *Handler) RequestCodexToken(c *gin.Context) {
@@ -508,89 +557,125 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	}
 
 	go func() {
-		// Initialize OAuth server
-		oauthServer := codex.NewOAuthServer(1455)
-
-		// Start OAuth callback server
-		if err = oauthServer.Start(); err != nil {
-			if strings.Contains(err.Error(), "already in use") {
-				authErr := codex.NewAuthenticationError(codex.ErrPortInUse, err)
+		// Wait for callback file
+		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-codex-%s.oauth", state))
+		deadline := time.Now().Add(5 * time.Minute)
+		var code string
+		for {
+			if time.Now().After(deadline) {
+				authErr := codex.NewAuthenticationError(codex.ErrCallbackTimeout, fmt.Errorf("timeout waiting for OAuth callback"))
 				log.Error(codex.GetUserFriendlyMessage(authErr))
+				oauthStatus[state] = "Timeout waiting for OAuth callback"
 				return
 			}
-			authErr := codex.NewAuthenticationError(codex.ErrServerStartFailed, err)
-			log.Fatalf("Failed to start OAuth callback server: %v", authErr)
-			return
-		}
-		defer func() {
-			if err = oauthServer.Stop(ctx); err != nil {
-				log.Warnf("Failed to stop OAuth server: %v", err)
+			if data, errR := os.ReadFile(waitFile); errR == nil {
+				var m map[string]string
+				_ = json.Unmarshal(data, &m)
+				_ = os.Remove(waitFile)
+				if errStr := m["error"]; errStr != "" {
+					oauthErr := codex.NewOAuthError(errStr, "", http.StatusBadRequest)
+					log.Error(codex.GetUserFriendlyMessage(oauthErr))
+					oauthStatus[state] = "Bad Request"
+					return
+				}
+				if m["state"] != state {
+					authErr := codex.NewAuthenticationError(codex.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, m["state"]))
+					oauthStatus[state] = "State code error"
+					log.Error(codex.GetUserFriendlyMessage(authErr))
+					return
+				}
+				code = m["code"]
+				break
 			}
-		}()
-
-		log.Info("Waiting for authentication callback...")
-
-		// Wait for OAuth callback
-		result, errWaitForCallback := oauthServer.WaitForCallback(5 * time.Minute)
-		if errWaitForCallback != nil {
-			if strings.Contains(errWaitForCallback.Error(), "timeout") {
-				authErr := codex.NewAuthenticationError(codex.ErrCallbackTimeout, errWaitForCallback)
-				log.Error(codex.GetUserFriendlyMessage(authErr))
-			} else {
-				log.Errorf("Authentication failed: %v", errWaitForCallback)
-			}
-			return
-		}
-
-		if result.Error != "" {
-			oauthErr := codex.NewOAuthError(result.Error, "", http.StatusBadRequest)
-			log.Error(codex.GetUserFriendlyMessage(oauthErr))
-			return
-		}
-
-		// Validate state parameter
-		if result.State != state {
-			authErr := codex.NewAuthenticationError(codex.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, result.State))
-			log.Error(codex.GetUserFriendlyMessage(authErr))
-			return
+			time.Sleep(500 * time.Millisecond)
 		}
 
 		log.Debug("Authorization code received, exchanging for tokens...")
-
-		// Exchange authorization code for tokens
-		authBundle, errExchangeCodeForTokens := openaiAuth.ExchangeCodeForTokens(ctx, result.Code, pkceCodes)
-		if errExchangeCodeForTokens != nil {
-			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchangeCodeForTokens)
+		// Extract client_id from authURL
+		clientID := ""
+		if u2, errP := url.Parse(authURL); errP == nil {
+			clientID = u2.Query().Get("client_id")
+		}
+		// Exchange code for tokens with redirect equal to mgmtRedirect
+		form := url.Values{
+			"grant_type":    {"authorization_code"},
+			"client_id":     {clientID},
+			"code":          {code},
+			"redirect_uri":  {"http://localhost:1455/auth/callback"},
+			"code_verifier": {pkceCodes.CodeVerifier},
+		}
+		httpClient := util.SetProxy(h.cfg, &http.Client{})
+		req, _ := http.NewRequestWithContext(ctx, "POST", "https://auth.openai.com/oauth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "application/json")
+		resp, errDo := httpClient.Do(req)
+		if errDo != nil {
+			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errDo)
+			oauthStatus[state] = "Failed to exchange authorization code for tokens"
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
-			log.Debug("This may be due to network issues or invalid authorization code")
 			return
 		}
-
-		// Create token storage
-		tokenStorage := openaiAuth.CreateTokenStorage(authBundle)
-
-		// Initialize Codex client
-		openaiClient, errWaitForCallback := client.NewCodexClient(h.cfg, tokenStorage)
-		if errWaitForCallback != nil {
-			log.Fatalf("Failed to initialize Codex client: %v", errWaitForCallback)
+		defer func() { _ = resp.Body.Close() }()
+		respBody, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			oauthStatus[state] = fmt.Sprintf("Token exchange failed with status %d", resp.StatusCode)
+			log.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(respBody))
 			return
 		}
-
-		// Save token storage
-		if errWaitForCallback = openaiClient.SaveTokenToFile(); errWaitForCallback != nil {
-			log.Fatalf("Failed to save authentication tokens: %v", errWaitForCallback)
+		var tokenResp struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			IDToken      string `json:"id_token"`
+			ExpiresIn    int    `json:"expires_in"`
+		}
+		if errU := json.Unmarshal(respBody, &tokenResp); errU != nil {
+			oauthStatus[state] = "Failed to parse token response"
+			log.Errorf("failed to parse token response: %v", errU)
 			return
 		}
+		claims, _ := codex.ParseJWTToken(tokenResp.IDToken)
+		email := ""
+		accountID := ""
+		if claims != nil {
+			email = claims.GetUserEmail()
+			accountID = claims.GetAccountID()
+		}
+		// Build bundle compatible with existing storage
+		bundle := &codex.CodexAuthBundle{
+			TokenData: codex.CodexTokenData{
+				IDToken:      tokenResp.IDToken,
+				AccessToken:  tokenResp.AccessToken,
+				RefreshToken: tokenResp.RefreshToken,
+				AccountID:    accountID,
+				Email:        email,
+				Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
+			},
+			LastRefresh: time.Now().Format(time.RFC3339),
+		}
 
+		// Create token storage and persist
+		tokenStorage := openaiAuth.CreateTokenStorage(bundle)
+		openaiClient, errInit := client.NewCodexClient(h.cfg, tokenStorage)
+		if errInit != nil {
+			oauthStatus[state] = "Failed to initialize Codex client"
+			log.Fatalf("Failed to initialize Codex client: %v", errInit)
+			return
+		}
+		if errSave := openaiClient.SaveTokenToFile(); errSave != nil {
+			oauthStatus[state] = "Failed to save authentication tokens"
+			log.Fatalf("Failed to save authentication tokens: %v", errSave)
+			return
+		}
 		log.Info("Authentication successful!")
-		if authBundle.APIKey != "" {
+		if bundle.APIKey != "" {
 			log.Info("API key obtained and saved")
 		}
-
 		log.Info("You can now use Codex services through this CLI")
+		delete(oauthStatus, state)
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL})
+	oauthStatus[state] = ""
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
 func (h *Handler) RequestQwenToken(c *gin.Context) {
@@ -598,6 +683,7 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 
 	log.Info("Initializing Qwen authentication...")
 
+	state := fmt.Sprintf("gem-%d", time.Now().UnixNano())
 	// Initialize Qwen auth service
 	qwenAuth := qwen.NewQwenAuth(h.cfg)
 
@@ -613,8 +699,9 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 		log.Info("Waiting for authentication...")
 		tokenData, errPollForToken := qwenAuth.PollForToken(deviceFlow.DeviceCode, deviceFlow.CodeVerifier)
 		if errPollForToken != nil {
+			oauthStatus[state] = "Authentication failed"
 			fmt.Printf("Authentication failed: %v\n", errPollForToken)
-			os.Exit(1)
+			return
 		}
 
 		// Create token storage
@@ -628,12 +715,30 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 		// Save token storage
 		if err = qwenClient.SaveTokenToFile(); err != nil {
 			log.Fatalf("Failed to save authentication tokens: %v", err)
+			oauthStatus[state] = "Failed to save authentication tokens"
 			return
 		}
 
 		log.Info("Authentication successful!")
 		log.Info("You can now use Qwen services through this CLI")
+		delete(oauthStatus, state)
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL})
+	oauthStatus[state] = ""
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+func (h *Handler) GetAuthStatus(c *gin.Context) {
+	state := c.Query("state")
+	if err, ok := oauthStatus[state]; ok {
+		if err != "" {
+			c.JSON(200, gin.H{"status": "error", "error": err})
+		} else {
+			c.JSON(200, gin.H{"status": "wait"})
+			return
+		}
+	} else {
+		c.JSON(200, gin.H{"status": "ok"})
+	}
+	delete(oauthStatus, state)
 }

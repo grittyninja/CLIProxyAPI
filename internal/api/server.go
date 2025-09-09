@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -145,6 +146,46 @@ func (s *Server) setupRoutes() {
 	})
 	s.engine.POST("/v1internal:method", geminiCLIHandlers.CLIHandler)
 
+	// OAuth callback endpoints (reuse main server port)
+	// These endpoints receive provider redirects and persist
+	// the short-lived code/state for the waiting goroutine.
+	s.engine.GET("/anthropic/callback", func(c *gin.Context) {
+		code := c.Query("code")
+		state := c.Query("state")
+		errStr := c.Query("error")
+		// Persist to a temporary file keyed by state
+		if state != "" {
+			file := fmt.Sprintf("%s/.oauth-anthropic-%s.oauth", s.cfg.AuthDir, state)
+			_ = os.WriteFile(file, []byte(fmt.Sprintf(`{"code":"%s","state":"%s","error":"%s"}`, code, state, errStr)), 0o600)
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, "<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>")
+	})
+
+	s.engine.GET("/codex/callback", func(c *gin.Context) {
+		code := c.Query("code")
+		state := c.Query("state")
+		errStr := c.Query("error")
+		if state != "" {
+			file := fmt.Sprintf("%s/.oauth-codex-%s.oauth", s.cfg.AuthDir, state)
+			_ = os.WriteFile(file, []byte(fmt.Sprintf(`{"code":"%s","state":"%s","error":"%s"}`, code, state, errStr)), 0o600)
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, "<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>")
+	})
+
+	s.engine.GET("/google/callback", func(c *gin.Context) {
+		code := c.Query("code")
+		state := c.Query("state")
+		errStr := c.Query("error")
+		if state != "" {
+			file := fmt.Sprintf("%s/.oauth-gemini-%s.oauth", s.cfg.AuthDir, state)
+			_ = os.WriteFile(file, []byte(fmt.Sprintf(`{"code":"%s","state":"%s","error":"%s"}`, code, state, errStr)), 0o600)
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, "<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>")
+	})
+
 	// Management API routes (delegated to management handlers)
 	// New logic: if remote-management-key is empty, do not expose any management endpoint (404).
 	if s.cfg.RemoteManagement.SecretKey != "" {
@@ -216,7 +257,7 @@ func (s *Server) setupRoutes() {
 			mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
 			mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
 			mgmt.GET("/qwen-auth-url", s.mgmt.RequestQwenToken)
-
+			mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 		}
 	}
 }
