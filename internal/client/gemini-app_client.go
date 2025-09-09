@@ -203,17 +203,90 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
         defer close(dataChan)
         defer close(errChan)
 
-        resp, err := c.SendRawMessage(ctx, modelName, rawJSON, alt)
+        // Normalize request into Gemini-style JSON if coming from OpenAI handler
+        if handler, ok := ctx.Value("handler").(interfaces.APIHandler); ok {
+            rawJSON = translator.Request(handler.HandlerType(), c.Type(), modelName, rawJSON, true)
+        }
+
+        // Log upstream API request body for request logger
+        if c.cfg.RequestLog {
+            if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
+                ginContext.Set("API_REQUEST", rawJSON)
+            }
+        }
+
+        // Build prompt/files and upload inline files if any
+        prompt, files, err := c.extractRequestData(rawJSON)
         if err != nil {
-            errChan <- err
+            errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
             return
         }
 
-		dataChan <- resp
-		dataChan <- []byte("[DONE]")
-	}()
+        var uploadedFiles []*UploadedFile
+        for _, fileData := range files {
+            tmpfile, e := os.CreateTemp("", "gemini-upload-*.bin")
+            if e != nil {
+                errChan <- &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to create temp file: %w", e)}
+                return
+            }
+            _, _ = tmpfile.Write(fileData)
+            _ = tmpfile.Close()
+            uploadedFile, e := c.uploadFile(tmpfile.Name())
+            os.Remove(tmpfile.Name())
+            if e != nil {
+                errChan <- &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to upload file: %w", e)}
+                return
+            }
+            uploadedFiles = append(uploadedFiles, uploadedFile)
+        }
 
-	return dataChan, errChan
+        // Call upstream Gemini App
+        output, genErr := c.generateContent(ctx, modelName, prompt, "", uploadedFiles...)
+        if genErr != nil {
+            status := 500
+            switch {
+            case errors.Is(genErr, errGeminiUsageLimitExceeded), errors.Is(genErr, errGeminiTemporarilyBlocked):
+                status = 429
+            case errors.Is(genErr, errGeminiModelInconsistent), errors.Is(genErr, errGeminiModelInvalid):
+                status = 400
+            }
+            errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: genErr}
+            return
+        }
+
+        // Build minimal OpenAI chat.completion.chunk stream
+        // 1) role chunk
+        created := time.Now().Unix()
+        id := fmt.Sprintf("%d-%s", created, "gemini-app")
+        roleChunk := fmt.Sprintf(`{"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null,"native_finish_reason":null}]}`,
+            id, created, modelName)
+        dataChan <- []byte(roleChunk)
+
+        // 2) final content chunk
+        content := ""
+        if output != nil && len(output.Candidates) > 0 {
+            content = output.Candidates[0].Text
+        }
+        finalChunk := fmt.Sprintf(`{"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"role":"assistant","content":%s},"finish_reason":"STOP","native_finish_reason":"STOP"}],"usage":{"completion_tokens":0,"total_tokens":0,"prompt_tokens":0}}`,
+            id, created, modelName, mustJSONMarshalString(content))
+        dataChan <- []byte(finalChunk)
+
+        // 3) [DONE]
+        dataChan <- []byte("[DONE]")
+    }()
+
+    return dataChan, errChan
+}
+
+// mustJSONMarshalString safely marshals a string into JSON string literal
+func mustJSONMarshalString(s string) string {
+    b, err := json.Marshal(s)
+    if err != nil {
+        esc := strings.ReplaceAll(s, "\"", "\\\"")
+        esc = strings.ReplaceAll(esc, "\n", "\\n")
+        return fmt.Sprintf("\"%s\"", esc)
+    }
+    return string(b)
 }
 
 func (c *GeminiAppClient) SendRawTokenCount(ctx context.Context, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
