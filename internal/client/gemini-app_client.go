@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"errors"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -24,20 +25,38 @@ import (
 	"github.com/luispater/CLIProxyAPI/internal/interfaces"
 	"github.com/luispater/CLIProxyAPI/internal/registry"
 	"github.com/luispater/CLIProxyAPI/internal/util"
+	"github.com/luispater/CLIProxyAPI/internal/translator/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
 const (
-	geminiAppBaseURL    = "https://gemini.google.com"
-	geminiAppGenerate   = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
-	geminiAppUpload     = "https://content-push.googleapis.com/upload"
-	geminiAppRotate     = "https://accounts.google.com/RotateCookies"
-	geminiAppInit       = "https://gemini.google.com/app"
-	geminiAppUserAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-	geminiAppPushID     = "feeds/mcudyrk2a4khkz"
-	geminiAppModelFlash = `[1,null,null,null,"71c2d248d3b102ff",null,null,0,[4]]`
-	geminiAppModelPro   = `[1,null,null,null,"4af6c7f5da75d65d",null,null,0,[4]]`
+    geminiAppBaseURL    = "https://gemini.google.com"
+    geminiAppGenerate   = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
+    geminiAppUpload     = "https://content-push.googleapis.com/upload"
+    geminiAppRotate     = "https://accounts.google.com/RotateCookies"
+    geminiAppInit       = "https://gemini.google.com/app"
+    geminiAppUserAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    geminiAppPushID     = "feeds/mcudyrk2a4khkz"
+    geminiAppModelFlash = `[1,null,null,null,"71c2d248d3b102ff",null,null,0,[4]]`
+    geminiAppModelPro   = `[1,null,null,null,"4af6c7f5da75d65d",null,null,0,[4]]`
+)
+
+// Minimal error codes mapping (from Gemini web responses)
+const (
+    errUsageLimitExceeded   = 1037
+    errModelInconsistent    = 1050
+    errModelHeaderInvalid   = 1052
+    errIPTemporarilyBlocked = 1060
+)
+
+// Typed errors for mapping to HTTP status codes
+var (
+    errGeminiUsageLimitExceeded = errors.New("usage limit exceeded")
+    errGeminiModelInconsistent  = errors.New("model inconsistent")
+    errGeminiModelInvalid       = errors.New("model invalid")
+    errGeminiTemporarilyBlocked = errors.New("temporarily blocked")
+    errGeminiAPI                = errors.New("API error")
 )
 
 type GeminiAppClient struct {
@@ -123,10 +142,14 @@ func (c *GeminiAppClient) GetEmail() string {
 }
 
 func (c *GeminiAppClient) SendRawMessage(ctx context.Context, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
-	prompt, files, err := c.extractRequestData(rawJSON)
-	if err != nil {
-		return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
-	}
+    // Normalize request into Gemini-style JSON if coming from OpenAI handler
+    if handler, ok := ctx.Value("handler").(interfaces.APIHandler); ok {
+        rawJSON = translator.Request(handler.HandlerType(), c.Type(), modelName, rawJSON, false)
+    }
+    prompt, files, err := c.extractRequestData(rawJSON)
+    if err != nil {
+        return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
+    }
 
 	var uploadedFiles []*UploadedFile
 	for _, fileData := range files {
@@ -149,28 +172,35 @@ func (c *GeminiAppClient) SendRawMessage(ctx context.Context, modelName string, 
 		uploadedFiles = append(uploadedFiles, uploadedFile)
 	}
 
-	output, err := c.generateContent(ctx, modelName, prompt, "", uploadedFiles...)
-	if err != nil {
-		log.Errorf("failed to generate content: %v", err)
-		return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to generate content: %w", err)}
-	}
+    output, err := c.generateContent(ctx, modelName, prompt, "", uploadedFiles...)
+    if err != nil {
+        log.Errorf("failed to generate content: %v", err)
+        status := 500
+        switch {
+        case errors.Is(err, errGeminiUsageLimitExceeded), errors.Is(err, errGeminiTemporarilyBlocked):
+            status = 429
+        case errors.Is(err, errGeminiModelInconsistent), errors.Is(err, errGeminiModelInvalid):
+            status = 400
+        }
+        return nil, &interfaces.ErrorMessage{StatusCode: status, Error: err}
+    }
 
 	return c.convertOutputToV1Beta(output, modelName)
 }
 
 func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName string, rawJSON []byte, alt string) (<-chan []byte, <-chan *interfaces.ErrorMessage) {
-	dataChan := make(chan []byte)
-	errChan := make(chan *interfaces.ErrorMessage)
+    dataChan := make(chan []byte)
+    errChan := make(chan *interfaces.ErrorMessage)
 
-	go func() {
-		defer close(dataChan)
-		defer close(errChan)
+    go func() {
+        defer close(dataChan)
+        defer close(errChan)
 
-		resp, err := c.SendRawMessage(ctx, modelName, rawJSON, alt)
-		if err != nil {
-			errChan <- err
-			return
-		}
+        resp, err := c.SendRawMessage(ctx, modelName, rawJSON, alt)
+        if err != nil {
+            errChan <- err
+            return
+        }
 
 		dataChan <- resp
 		dataChan <- []byte("[DONE]")
@@ -366,21 +396,45 @@ func (c *GeminiAppClient) uploadFile(filePath string) (*UploadedFile, error) {
 		return nil, fmt.Errorf("failed to close multipart writer: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", geminiAppUpload, &requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create upload request: %w", err)
-	}
+    req, err := http.NewRequest("POST", geminiAppUpload, &requestBody)
+    if err != nil {
+        return nil, fmt.Errorf("failed to create upload request: %w", err)
+    }
 
-	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
-	req.Header.Set("Push-ID", geminiAppPushID)
+    req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+    req.Header.Set("Push-ID", geminiAppPushID)
 
-	req.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(requestBody.Bytes())), nil
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute upload request: %w", err)
-	}
+    req.GetBody = func() (io.ReadCloser, error) {
+        return io.NopCloser(bytes.NewReader(requestBody.Bytes())), nil
+    }
+
+    // Use a local client to preserve POST + body across redirects
+    localClient := &http.Client{
+        CheckRedirect: func(r *http.Request, via []*http.Request) error {
+            if len(via) > 0 {
+                r.Method = via[0].Method
+                r.Header = via[0].Header.Clone()
+                if via[0].GetBody != nil {
+                    if body, err := via[0].GetBody(); err == nil {
+                        r.Body = body
+                    } else {
+                        r.Body = io.NopCloser(bytes.NewReader(requestBody.Bytes()))
+                    }
+                } else {
+                    r.Body = io.NopCloser(bytes.NewReader(requestBody.Bytes()))
+                }
+            }
+            return nil
+        },
+        Transport: c.httpClient.Transport,
+        Jar:       c.httpClient.Jar,
+        Timeout:   c.httpClient.Timeout,
+    }
+
+    resp, err := localClient.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("failed to execute upload request: %w", err)
+    }
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -473,7 +527,8 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 		return nil, fmt.Errorf("failed to find valid JSON data in response: %s", string(body))
 	}
 
-	var textBuilder strings.Builder
+    var textBuilder strings.Builder
+    foundAnyText := false
 	for _, part := range responseData {
 		if len(part) < 3 {
 			continue
@@ -491,22 +546,82 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 			candidatesData, _ := mainPart[4].([]interface{})
 			for _, candData := range candidatesData {
 				candList, _ := candData.([]interface{})
-				if len(candList) > 1 {
-					textSlice, _ := candList[1].([]interface{})
-					if len(textSlice) > 0 {
-						text, _ := textSlice[0].(string)
-						textBuilder.WriteString(text)
-					}
-				}
-			}
-		}
-	}
+                if len(candList) > 1 {
+                    textSlice, _ := candList[1].([]interface{})
+                    if len(textSlice) > 0 {
+                        text, _ := textSlice[0].(string)
+                        textBuilder.WriteString(text)
+                        if text != "" {
+                            foundAnyText = true
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-	return &ModelOutput{
-		Candidates: []Candidate{
-			{Text: textBuilder.String()},
-		},
-	}, nil
+    // Minimal error code mapping if no candidate text was found
+    if !foundAnyText {
+        if errCode, errGetCode := safeGetFloat([][][]interface{}{responseData}, 0, 5, 2, 0, 1); errGetCode == nil {
+            switch int(errCode) {
+            case errUsageLimitExceeded:
+                return nil, errGeminiUsageLimitExceeded
+            case errModelInconsistent:
+                return nil, errGeminiModelInconsistent
+            case errModelHeaderInvalid:
+                return nil, errGeminiModelInvalid
+            case errIPTemporarilyBlocked:
+                return nil, errGeminiTemporarilyBlocked
+            default:
+                return nil, fmt.Errorf("API error with code: %d", int(errCode))
+            }
+        }
+        return nil, errGeminiAPI
+    }
+
+    return &ModelOutput{
+        Candidates: []Candidate{
+            {Text: textBuilder.String()},
+        },
+        }, nil
+}
+
+// Helper functions for minimal nested slice traversal (error code extraction)
+func safeGet(data []interface{}, index int) (interface{}, error) {
+    if len(data) <= index {
+        return nil, fmt.Errorf("index %d out of bounds for slice of length %d", index, len(data))
+    }
+    return data[index], nil
+}
+
+func safeGetFloat(data [][][]interface{}, indices ...int) (float64, error) {
+    var current interface{} = data
+    for i, index := range indices {
+        switch c := current.(type) {
+        case [][][]interface{}:
+            if index >= len(c) {
+                return 0, fmt.Errorf("index %d out of bounds for [][][]interface{}", index)
+            }
+            current = c[index]
+        case [][]interface{}:
+            if index >= len(c) {
+                return 0, fmt.Errorf("index %d out of bounds for [][]interface{}", index)
+            }
+            current = c[index]
+        case []interface{}:
+            if index >= len(c) {
+                return 0, fmt.Errorf("index %d out of bounds for []interface{}", index)
+            }
+            current = c[index]
+        default:
+            return 0, fmt.Errorf("unexpected type at depth %d: %T", i, current)
+        }
+    }
+    f, ok := current.(float64)
+    if !ok {
+        return 0, fmt.Errorf("final value is not a float64, but %T", current)
+    }
+    return f, nil
 }
 
 func (c *GeminiAppClient) convertOutputToV1Beta(output *ModelOutput, modelName string) ([]byte, *interfaces.ErrorMessage) {
