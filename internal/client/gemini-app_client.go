@@ -262,7 +262,17 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
             id, created, modelName)
         dataChan <- []byte(roleChunk)
 
-        // 2) final content chunk
+        // 2) reasoning chunks (if any)
+        if output != nil && len(output.Candidates) > 0 && strings.TrimSpace(output.Candidates[0].Thoughts) != "" {
+            segments := splitReasoningSegments(output.Candidates[0].Thoughts)
+            for _, seg := range segments {
+                rcChunk := fmt.Sprintf(`{"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"role":"assistant","content":null,"reasoning_content":%s,"tool_calls":null},"finish_reason":null,"native_finish_reason":null}],"usage":{"prompt_tokens":0}}`,
+                    id, created, modelName, mustJSONMarshalString(seg))
+                dataChan <- []byte(rcChunk)
+            }
+        }
+
+        // 3) final content chunk
         content := ""
         if output != nil && len(output.Candidates) > 0 {
             content = output.Candidates[0].Text
@@ -271,7 +281,7 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
             id, created, modelName, mustJSONMarshalString(content))
         dataChan <- []byte(finalChunk)
 
-        // 3) [DONE]
+        // 4) [DONE]
         dataChan <- []byte("[DONE]")
     }()
 
@@ -287,6 +297,22 @@ func mustJSONMarshalString(s string) string {
         return fmt.Sprintf("\"%s\"", esc)
     }
     return string(b)
+}
+
+func splitReasoningSegments(s string) []string {
+    s = strings.TrimSpace(s)
+    if s == "" {
+        return nil
+    }
+    parts := strings.Split(s, "\n\n")
+    out := make([]string, 0, len(parts))
+    for _, p := range parts {
+        p = strings.TrimSpace(p)
+        if p != "" {
+            out = append(out, p)
+        }
+    }
+    return out
 }
 
 func (c *GeminiAppClient) SendRawTokenCount(ctx context.Context, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
@@ -612,6 +638,7 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 	}
 
     var textBuilder strings.Builder
+    var thoughtsBuilder strings.Builder
     foundAnyText := false
 	for _, part := range responseData {
 		if len(part) < 3 {
@@ -631,6 +658,19 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 			for _, candData := range candidatesData {
 				candList, _ := candData.([]interface{})
                 if len(candList) > 1 {
+                    // Extract thoughts at [37][0][0] if present
+                    if len(candList) > 37 {
+                        if arr1, ok := candList[37].([]interface{}); ok && len(arr1) > 0 {
+                            if arr2, ok2 := arr1[0].([]interface{}); ok2 && len(arr2) > 0 {
+                                if ts, ok3 := arr2[0].(string); ok3 && ts != "" {
+                                    thoughtsBuilder.WriteString(ts)
+                                    if !strings.HasSuffix(ts, "\n\n") {
+                                        thoughtsBuilder.WriteString("\n\n")
+                                    }
+                                }
+                            }
+                        }
+                    }
                     textSlice, _ := candList[1].([]interface{})
                     if len(textSlice) > 0 {
                         text, _ := textSlice[0].(string)
@@ -665,7 +705,7 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 
     return &ModelOutput{
         Candidates: []Candidate{
-            {Text: textBuilder.String()},
+            {Text: textBuilder.String(), Thoughts: strings.TrimSpace(thoughtsBuilder.String())},
         },
         }, nil
 }
@@ -709,29 +749,18 @@ func safeGetFloat(data [][][]interface{}, indices ...int) (float64, error) {
 }
 
 func (c *GeminiAppClient) convertOutputToV1Beta(output *ModelOutput, modelName string) ([]byte, *interfaces.ErrorMessage) {
-	// A simplified conversion for now
-	resp := fmt.Sprintf(`{
-		"candidates": [
-			{
-				"content": {
-					"parts": [
-						{
-							"text": "%s"
-						}
-					],
-					"role": "model"
-				},
-				"finishReason": "STOP"
-			}
-		],
-		"usageMetadata": {
-			"promptTokenCount": 0,
-			"candidatesTokenCount": 0,
-			"totalTokenCount": 0
-		}
-	}`, jsonEscape(output.Candidates[0].Text))
-
-	return []byte(resp), nil
+    // Return OpenAI Chat Completions non-stream format for better compatibility
+    id := fmt.Sprintf("%d-%s", time.Now().UnixNano(), "gemini-app")
+    created := time.Now().Unix()
+    content := jsonEscape(output.Candidates[0].Text)
+    thoughts := output.Candidates[0].Thoughts
+    reasoning := "null"
+    if strings.TrimSpace(thoughts) != "" {
+        reasoning = fmt.Sprintf("\"%s\"", jsonEscape(thoughts))
+    }
+    resp := fmt.Sprintf(`{"id":"%s","object":"chat.completion","created":%d,"model":"%s","choices":[{"index":0,"message":{"role":"assistant","content":"%s","reasoning_content":%s},"finish_reason":"STOP","native_finish_reason":"STOP"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
+        id, created, modelName, content, reasoning)
+    return []byte(resp), nil
 }
 
 func jsonEscape(i string) string {
@@ -745,12 +774,13 @@ func jsonEscape(i string) string {
 
 // Dummy structs to represent the output from the gemini-app logic
 type ModelOutput struct {
-	Candidates []Candidate
-	Metadata   []string
+    Candidates []Candidate
+    Metadata   []string
 }
 
 type Candidate struct {
-	Text string
+    Text     string
+    Thoughts string
 }
 
 type UploadedFile struct {
