@@ -1,10 +1,10 @@
 package client
 
 import (
-	"bytes"
-	"context"
-	"errors"
-	"encoding/base64"
+    "bytes"
+    "context"
+    "errors"
+    "encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,18 +16,19 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
-	"time"
+    "sync"
+    "time"
 
-	"github.com/luispater/CLIProxyAPI/internal/auth/gemini"
-	"github.com/luispater/CLIProxyAPI/internal/config"
-	. "github.com/luispater/CLIProxyAPI/internal/constant"
-	"github.com/luispater/CLIProxyAPI/internal/interfaces"
-	"github.com/luispater/CLIProxyAPI/internal/registry"
-	"github.com/luispater/CLIProxyAPI/internal/util"
-	"github.com/luispater/CLIProxyAPI/internal/translator/translator"
-	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
+    "github.com/gin-gonic/gin"
+    "github.com/luispater/CLIProxyAPI/internal/auth/gemini"
+    "github.com/luispater/CLIProxyAPI/internal/config"
+    . "github.com/luispater/CLIProxyAPI/internal/constant"
+    "github.com/luispater/CLIProxyAPI/internal/interfaces"
+    "github.com/luispater/CLIProxyAPI/internal/registry"
+    "github.com/luispater/CLIProxyAPI/internal/util"
+    "github.com/luispater/CLIProxyAPI/internal/translator/translator"
+    log "github.com/sirupsen/logrus"
+    "github.com/tidwall/gjson"
 )
 
 const (
@@ -145,6 +146,12 @@ func (c *GeminiAppClient) SendRawMessage(ctx context.Context, modelName string, 
     // Normalize request into Gemini-style JSON if coming from OpenAI handler
     if handler, ok := ctx.Value("handler").(interfaces.APIHandler); ok {
         rawJSON = translator.Request(handler.HandlerType(), c.Type(), modelName, rawJSON, false)
+    }
+    // Log upstream API request body for request logger
+    if c.cfg.RequestLog {
+        if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
+            ginContext.Set("API_REQUEST", rawJSON)
+        }
     }
     prompt, files, err := c.extractRequestData(rawJSON)
     if err != nil {
@@ -504,15 +511,19 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status code %d: %s", resp.StatusCode, string(body))
-	}
+    if resp.StatusCode != http.StatusOK {
+        body, _ := io.ReadAll(resp.Body)
+        // Log upstream API response even on error
+        c.AddAPIResponseData(ctx, body)
+        return nil, fmt.Errorf("API request failed with status code %d: %s", resp.StatusCode, string(body))
+    }
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return nil, err
+    }
+    // Log upstream API response body for request logger
+    c.AddAPIResponseData(ctx, body)
 
 	lines := strings.Split(string(body), "\n")
 	var responseData [][]interface{}
