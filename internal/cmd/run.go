@@ -305,6 +305,19 @@ func buildAPIKeyClients(cfg *config.Config) (map[string]interfaces.Client, int, 
 	codexAPIKeyCount := 0
 	openAICompatCount := 0
 
+	if len(cfg.GeminiAppToken) > 0 {
+		for _, token := range cfg.GeminiAppToken {
+			log.Debug("Initializing with Gemini App Token...")
+			cliClient, err := client.NewGeminiAppClient(cfg, token.Secure1PSID, token.Secure1PSIDTS)
+			if err != nil {
+				log.Errorf("failed to create Gemini App client: %v", err)
+				continue
+			}
+			apiKeyClients[cliClient.GetClientID()] = cliClient
+			glAPIKeyCount++ // Reuse this counter for now
+		}
+	}
+
 	if len(cfg.GlAPIKey) > 0 {
 		for _, key := range cfg.GlAPIKey {
 			httpClient := util.SetProxy(cfg, &http.Client{})

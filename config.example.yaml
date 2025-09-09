@@ -46,6 +46,14 @@ codex-api-key:
   - api-key: "sk-atSM..."
     base-url: "https://www.example.com" # use the custom codex API endpoint
 
+# Gemini App Tokens (optional, for web-based reverse proxy)
+# List of Gemini App cookie tokens for multi-account load balancing.
+# gemini-app-token:
+#   - secure_1psid: "your_secure_1psid_token_1"
+#     secure_1psidts: "your_secure_1psidts_token_1"
+#   - secure_1psid: "your_secure_1psid_token_2"
+#     secure_1psidts: "your_secure_1psidts_token_2"
+
 # Claude API keys
 claude-api-key:
   - api-key: "sk-atSM..." # use the official claude API key, no need to set the base url
