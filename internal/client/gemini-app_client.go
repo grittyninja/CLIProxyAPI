@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/luispater/CLIProxyAPI/internal/auth/gemini"
 	"github.com/luispater/CLIProxyAPI/internal/config"
 	. "github.com/luispater/CLIProxyAPI/internal/constant"
 	"github.com/luispater/CLIProxyAPI/internal/interfaces"
@@ -41,20 +42,19 @@ const (
 
 type GeminiAppClient struct {
 	ClientBase
-	secure1psid   string
-	secure1psidts string
 	accessToken   string
 	cookies       []*http.Cookie
+	tokenFilePath string
 }
 
-func NewGeminiAppClient(cfg *config.Config, secure1psid, secure1psidts string) (*GeminiAppClient, error) {
+func NewGeminiAppClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, tokenFilePath string) (*GeminiAppClient, error) {
 	jar, _ := cookiejar.New(nil)
 	cookieURL, _ := url.Parse(geminiAppBaseURL)
 	cookies := []*http.Cookie{
-		{Name: "__Secure-1PSID", Value: secure1psid, Domain: ".google.com"},
+		{Name: "__Secure-1PSID", Value: ts.Secure1PSID, Domain: ".google.com"},
 	}
-	if secure1psidts != "" {
-		cookies = append(cookies, &http.Cookie{Name: "__Secure-1PSIDTS", Value: secure1psidts, Domain: ".google.com"})
+	if ts.Secure1PSIDTS != "" {
+		cookies = append(cookies, &http.Cookie{Name: "__Secure-1PSIDTS", Value: ts.Secure1PSIDTS, Domain: ".google.com"})
 	}
 	jar.SetCookies(cookieURL, cookies)
 
@@ -74,17 +74,17 @@ func NewGeminiAppClient(cfg *config.Config, secure1psid, secure1psidts string) (
 		Transport: transport,
 	}
 
-	clientID := fmt.Sprintf("gemini-app-%s-%d", secure1psid[:8], time.Now().UnixNano())
+	clientID := fmt.Sprintf("gemini-app-%s-%d", ts.Secure1PSID[:8], time.Now().UnixNano())
 	client := &GeminiAppClient{
 		ClientBase: ClientBase{
 			RequestMutex:       &sync.Mutex{},
 			httpClient:         httpClient,
 			cfg:                cfg,
+			tokenStorage:       ts,
 			modelQuotaExceeded: make(map[string]*time.Time),
 		},
-		secure1psid:   secure1psid,
-		secure1psidts: secure1psidts,
 		cookies:       cookies,
+		tokenFilePath: tokenFilePath,
 	}
 
 	client.InitializeModelRegistry(clientID)
@@ -118,7 +118,8 @@ func (c *GeminiAppClient) CanProvideModel(modelName string) bool {
 }
 
 func (c *GeminiAppClient) GetEmail() string {
-	return fmt.Sprintf("cookie-%s", c.secure1psid[:8])
+	base := filepath.Base(c.tokenFilePath)
+	return strings.TrimSuffix(base, ".json")
 }
 
 func (c *GeminiAppClient) SendRawMessage(ctx context.Context, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
@@ -183,7 +184,9 @@ func (c *GeminiAppClient) SendRawTokenCount(ctx context.Context, modelName strin
 }
 
 func (c *GeminiAppClient) SaveTokenToFile() error {
-	return nil
+	ts := c.tokenStorage.(*gemini.GeminiAppTokenStorage)
+	log.Infof("Saving Gemini App credentials to %s", c.tokenFilePath)
+	return ts.SaveTokenToFile(c.tokenFilePath)
 }
 
 func (c *GeminiAppClient) IsModelQuotaExceeded(model string) bool {
@@ -202,7 +205,7 @@ func (c *GeminiAppClient) GetUserAgent() string {
 }
 
 func (c *GeminiAppClient) RefreshTokens(ctx context.Context) error {
-	return nil
+	return c.refreshAccessToken()
 }
 
 func (c *GeminiAppClient) rotateCookies() error {
@@ -220,6 +223,19 @@ func (c *GeminiAppClient) rotateCookies() error {
 		// The new cookies are automatically added to the jar
 		cookieURL, _ := url.Parse(geminiAppBaseURL)
 		c.cookies = c.httpClient.Jar.Cookies(cookieURL)
+
+		// Update token storage and save to file
+		ts := c.tokenStorage.(*gemini.GeminiAppTokenStorage)
+		for _, cookie := range c.cookies {
+			if cookie.Name == "__Secure-1PSID" {
+				ts.Secure1PSID = cookie.Value
+			} else if cookie.Name == "__Secure-1PSIDTS" {
+				ts.Secure1PSIDTS = cookie.Value
+			}
+		}
+		if err := c.SaveTokenToFile(); err != nil {
+			log.Errorf("Failed to save rotated cookies for %s: %v", c.GetEmail(), err)
+		}
 	} else {
 		body, _ := io.ReadAll(resp.Body)
 		log.Errorf("Failed to rotate cookies for %s, status: %d, body: %s", c.GetEmail(), resp.StatusCode, string(body))
@@ -264,6 +280,17 @@ func (c *GeminiAppClient) refreshAccessToken() error {
 	if len(matches) > 1 {
 		c.accessToken = matches[1]
 		c.cookies = c.httpClient.Jar.Cookies(req.URL)
+		ts := c.tokenStorage.(*gemini.GeminiAppTokenStorage)
+		for _, cookie := range c.cookies {
+			if cookie.Name == "__Secure-1PSID" {
+				ts.Secure1PSID = cookie.Value
+			} else if cookie.Name == "__Secure-1PSIDTS" {
+				ts.Secure1PSIDTS = cookie.Value
+			}
+		}
+		if err := c.SaveTokenToFile(); err != nil {
+			log.Errorf("Failed to save refreshed cookies for %s: %v", c.GetEmail(), err)
+		}
 		return nil
 	}
 
@@ -415,7 +442,7 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 
 	c.setHeaders(req, modelName)
 
-	log.Debugf("Request cookies: %+v", req.Cookies())
+	log.Debugf("Making request with Gemini App client: %s", c.GetEmail())
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

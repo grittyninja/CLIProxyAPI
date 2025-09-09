@@ -127,6 +127,19 @@ func StartService(cfg *config.Config, configPath string) {
 					cliClients[path] = qwenClient
 					successfulAuthCount++
 				}
+			} else if tokenType == "gemini-app" {
+				var ts gemini.GeminiAppTokenStorage
+				if err = json.Unmarshal(data, &ts); err == nil {
+					log.Info("Initializing gemini-app authentication for token...")
+					geminiAppClient, errClient := client.NewGeminiAppClient(cfg, &ts, path)
+					if errClient != nil {
+						log.Errorf("failed to create gemini-app client for token %s: %v", path, errClient)
+						return errClient
+					}
+					log.Info("Authentication successful.")
+					cliClients[path] = geminiAppClient
+					successfulAuthCount++
+				}
 			}
 		}
 		return nil
@@ -304,19 +317,6 @@ func buildAPIKeyClients(cfg *config.Config) (map[string]interfaces.Client, int, 
 	claudeAPIKeyCount := 0
 	codexAPIKeyCount := 0
 	openAICompatCount := 0
-
-	if len(cfg.GeminiAppToken) > 0 {
-		for _, token := range cfg.GeminiAppToken {
-			log.Debug("Initializing with Gemini App Token...")
-			cliClient, err := client.NewGeminiAppClient(cfg, token.Secure1PSID, token.Secure1PSIDTS)
-			if err != nil {
-				log.Errorf("failed to create Gemini App client: %v", err)
-				continue
-			}
-			apiKeyClients[cliClient.GetClientID()] = cliClient
-			glAPIKeyCount++ // Reuse this counter for now
-		}
-	}
 
 	if len(cfg.GlAPIKey) > 0 {
 		for _, key := range cfg.GlAPIKey {

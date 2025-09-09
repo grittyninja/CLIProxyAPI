@@ -55,15 +55,6 @@ type Config struct {
 
 	// RemoteManagement nests management-related options under 'remote-management'.
 	RemoteManagement RemoteManagement `yaml:"remote-management" json:"-"`
-
-	// GeminiAppToken defines a list of Gemini App tokens as specified in the YAML configuration file.
-	GeminiAppToken []GeminiAppToken `yaml:"gemini-app-token" json:"gemini-app-token"`
-}
-
-// GeminiAppToken represents the configuration for a Gemini App token.
-type GeminiAppToken struct {
-	Secure1PSID   string `yaml:"secure_1psid"`
-	Secure1PSIDTS string `yaml:"secure_1psidts"`
 }
 
 // RemoteManagement holds management API configuration under 'remote-management'.
