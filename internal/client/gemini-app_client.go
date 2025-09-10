@@ -257,14 +257,52 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
 			}
 		}
 
+		// Start keepalive: immediately emit an initial role/empty chunk and then periodic empty chunks
+		// until the first real chunk is available. This prevents 60s idle timeouts on proxies.
+		var kaOnce sync.Once
+		stopKA := make(chan struct{})
+		stopKeepalive := func() { kaOnce.Do(func() { close(stopKA) }) }
+		sendKeepalive := func() {
+			var param any
+			if translator.NeedConvert(handlerType, c.Type()) && handlerType != GEMINI {
+				lines := translator.Response(handlerType, c.Type(), ctx, modelName, originalRequestRawJSON, rawJSON, buildGeminiChunk(modelName, "", false, "", false, false), &param)
+				for _, l := range lines {
+					if l != "" {
+						dataChan <- []byte(l)
+					}
+				}
+			} else {
+				dataChan <- buildGeminiChunk(modelName, "", false, "", false, false)
+			}
+		}
+		// Send initial keepalive chunk right away
+		sendKeepalive()
+		// Ticker for periodic keepalive before first real chunk
+		go func() {
+			ticker := time.NewTicker(12 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-stopKA:
+					return
+				case <-ticker.C:
+					sendKeepalive()
+				}
+			}
+		}()
+
         // Build messages and upload inline files if any
         messages, files, mimes, err := c.parseMessagesAndFiles(rawJSON)
         if err != nil {
+            stopKeepalive()
             errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
             return
         }
         uploadedFiles, upErr := c.uploadInlineFiles(files, mimes)
         if upErr != nil {
+            stopKeepalive()
             errChan <- upErr
             return
         }
@@ -292,17 +330,19 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
                 c.modelQuotaExceeded[modelName] = &now
                 c.SetModelQuotaExceeded(modelName)
             }
+            stopKeepalive()
             errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: genErr}
             return
         }
 
-		// Clear quota status on success
-		delete(c.modelQuotaExceeded, modelName)
-		c.ClearModelQuotaExceeded(modelName)
+        // Clear quota status on success
+        delete(c.modelQuotaExceeded, modelName)
+        c.ClearModelQuotaExceeded(modelName)
 
         // Convert to Gemini response JSON first
         gemBytes, errMsg := c.convertOutputToGemini(output, modelName)
         if errMsg != nil {
+            stopKeepalive()
             errChan <- errMsg
             return
         }
@@ -314,14 +354,16 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
             c.storeConversation(modelName, cleaned, output.Candidates[0].Text, output.Metadata)
         }
 
-		// If handler expects another format (e.g. OpenAI/Claude/GeminiCLI),
-		// simulate streaming by emitting Gemini-shaped chunks and translating each chunk.
-		if translator.NeedConvert(handlerType, c.Type()) && handlerType != GEMINI {
-			simulateTranslatedStreaming(ctx, dataChan, handlerType, c.Type(), modelName, originalRequestRawJSON, rawJSON, output)
-			return
-		}
+        // If handler expects another format (e.g. OpenAI/Claude/GeminiCLI),
+        // simulate streaming by emitting Gemini-shaped chunks and translating each chunk.
+        if translator.NeedConvert(handlerType, c.Type()) && handlerType != GEMINI {
+            stopKeepalive()
+            simulateTranslatedStreaming(ctx, dataChan, handlerType, c.Type(), modelName, originalRequestRawJSON, rawJSON, output)
+            return
+        }
         // Otherwise (Gemini->Gemini passthrough), simulate streaming like docs/gemini-fastapi
         // by splitting the final text into small chunks and emitting Gemini-shaped JSON.
+        stopKeepalive()
         simulateGeminiStreaming(dataChan, modelName, output)
     }()
 
