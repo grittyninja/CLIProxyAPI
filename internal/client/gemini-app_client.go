@@ -3,8 +3,10 @@
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +43,8 @@ const (
 	geminiAppPushID     = "feeds/mcudyrk2a4khkz"
 	geminiAppModelFlash = `[1,null,null,null,"71c2d248d3b102ff",null,null,0,[4]]`
 	geminiAppModelPro   = `[1,null,null,null,"4af6c7f5da75d65d",null,null,0,[4]]`
+	geminiAppContHint   = "\n(More messages to come, please reply with just 'ok.')"
+	geminiAppMaxChars   = 24000
 )
 
 // Minimal error codes mapping (from Gemini web responses)
@@ -61,10 +65,14 @@ var (
 )
 
 type GeminiAppClient struct {
-	ClientBase
-	accessToken   string
-	cookies       []*http.Cookie
-	tokenFilePath string
+    ClientBase
+    accessToken   string
+    cookies       []*http.Cookie
+    tokenFilePath string
+
+	// in-memory conversation store: key -> metadata
+	convStore map[string][]string
+	convMutex sync.RWMutex
 }
 
 func NewGeminiAppClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, tokenFilePath string) (*GeminiAppClient, error) {
@@ -97,6 +105,7 @@ func NewGeminiAppClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, to
 		},
 		cookies:       cookies,
 		tokenFilePath: tokenFilePath,
+		convStore:     make(map[string][]string),
 	}
 
 	client.InitializeModelRegistry(clientID)
@@ -135,8 +144,8 @@ func (c *GeminiAppClient) GetEmail() string {
 }
 
 func (c *GeminiAppClient) SendRawMessage(ctx context.Context, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
-	// Keep a pristine copy for translator context
-	originalRequestRawJSON := bytes.Clone(rawJSON)
+    // Keep a pristine copy for translator context
+    originalRequestRawJSON := bytes.Clone(rawJSON)
 
 	// Normalize request into Gemini-style JSON if coming from another handler
 	var handlerType string
@@ -152,23 +161,35 @@ func (c *GeminiAppClient) SendRawMessage(ctx context.Context, modelName string, 
 		}
 	}
 
-	// Parse prompt and upload inline files (if any)
-	prompt, files, mimes, err := c.extractRequestData(rawJSON)
-	if err != nil {
-		return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
-	}
-	uploadedFiles, upErr := c.uploadInlineFiles(files, mimes)
-	if upErr != nil {
-		return nil, upErr
-	}
+    // Parse messages and inline files (if any)
+    messages, files, mimes, err := c.parseMessagesAndFiles(rawJSON)
+    if err != nil {
+        return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
+    }
+    uploadedFiles, upErr := c.uploadInlineFiles(files, mimes)
+    if upErr != nil {
+        return nil, upErr
+    }
 
-	// Perform generation via the web API
-	output, genErr := c.generateContent(ctx, modelName, prompt, "", uploadedFiles...)
-	if genErr != nil {
-		log.Errorf("failed to generate content: %v", genErr)
-		status := 500
-		switch {
-		case errors.Is(genErr, errGeminiUsageLimitExceeded), errors.Is(genErr, errGeminiTemporarilyBlocked):
+    // Conversation reuse: try to find prior metadata by history prefix ending with assistant/system
+    cleaned := sanitizeAssistantMessages(messages)
+    meta, reuseIdx := c.findReusableMetadata(modelName, cleaned)
+
+    // Build prompt from remaining messages (suffix);
+    // if only one new user message and we have metadata, skip role tags.
+    useTags := needRoleTags(messages)
+    if reuseIdx > 0 && len(messages[reuseIdx:]) == 1 && strings.ToLower(messages[reuseIdx].Role) == "user" {
+        useTags = false
+    }
+    prompt := buildPrompt(messages[reuseIdx:], useTags, useTags)
+
+    // Perform generation via the web API
+    output, genErr := c.sendWithSplit(ctx, modelName, prompt, meta, uploadedFiles...)
+    if genErr != nil {
+        log.Errorf("failed to generate content: %v", genErr)
+        status := 500
+        switch {
+        case errors.Is(genErr, errGeminiUsageLimitExceeded), errors.Is(genErr, errGeminiTemporarilyBlocked):
 			status = 429
 		case errors.Is(genErr, errGeminiModelInconsistent), errors.Is(genErr, errGeminiModelInvalid):
 			status = 400
@@ -181,25 +202,30 @@ func (c *GeminiAppClient) SendRawMessage(ctx context.Context, modelName string, 
 		return nil, &interfaces.ErrorMessage{StatusCode: status, Error: genErr}
 	}
 
-	// Clear quota status on success
-	delete(c.modelQuotaExceeded, modelName)
-	c.ClearModelQuotaExceeded(modelName)
+    // Clear quota status on success
+    delete(c.modelQuotaExceeded, modelName)
+    c.ClearModelQuotaExceeded(modelName)
 
-	// Convert to Gemini API-style JSON, then translate if needed for handler
-	gemBytes, errMsg := c.convertOutputToGemini(output, modelName)
-	if errMsg != nil {
-		return nil, errMsg
-	}
+    // Convert to Gemini API-style JSON, then translate if needed for handler
+    gemBytes, errMsg := c.convertOutputToGemini(output, modelName)
+    if errMsg != nil {
+        return nil, errMsg
+    }
 
-	// Log the constructed upstream-like response for request logger
-	c.AddAPIResponseData(ctx, gemBytes)
+    // Log the constructed upstream-like response for request logger
+    c.AddAPIResponseData(ctx, gemBytes)
 
-	if translator.NeedConvert(handlerType, c.Type()) {
-		var param any
-		out := translator.ResponseNonStream(handlerType, c.Type(), ctx, modelName, originalRequestRawJSON, rawJSON, gemBytes, &param)
-		return []byte(out), nil
-	}
-	return gemBytes, nil
+    // Store refreshed conversation metadata for future reuse
+    if output != nil && len(output.Metadata) > 0 && len(output.Candidates) > 0 {
+        c.storeConversation(modelName, cleaned, output.Candidates[0].Text, output.Metadata)
+    }
+
+    if translator.NeedConvert(handlerType, c.Type()) {
+        var param any
+        out := translator.ResponseNonStream(handlerType, c.Type(), ctx, modelName, originalRequestRawJSON, rawJSON, gemBytes, &param)
+        return []byte(out), nil
+    }
+    return gemBytes, nil
 }
 
 func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName string, rawJSON []byte, alt string) (<-chan []byte, <-chan *interfaces.ErrorMessage) {
@@ -227,50 +253,62 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
 			}
 		}
 
-		// Build prompt and upload inline files if any
-		prompt, files, mimes, err := c.extractRequestData(rawJSON)
-		if err != nil {
-			errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
-			return
-		}
-		uploadedFiles, upErr := c.uploadInlineFiles(files, mimes)
-		if upErr != nil {
-			errChan <- upErr
-			return
-		}
+        // Build messages and upload inline files if any
+        messages, files, mimes, err := c.parseMessagesAndFiles(rawJSON)
+        if err != nil {
+            errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
+            return
+        }
+        uploadedFiles, upErr := c.uploadInlineFiles(files, mimes)
+        if upErr != nil {
+            errChan <- upErr
+            return
+        }
 
-		// Call upstream Gemini App
-		output, genErr := c.generateContent(ctx, modelName, prompt, "", uploadedFiles...)
-		if genErr != nil {
-			status := 500
-			switch {
-			case errors.Is(genErr, errGeminiUsageLimitExceeded), errors.Is(genErr, errGeminiTemporarilyBlocked):
-				status = 429
-			case errors.Is(genErr, errGeminiModelInconsistent), errors.Is(genErr, errGeminiModelInvalid):
-				status = 400
-			}
-			if status == 429 {
-				now := time.Now()
-				c.modelQuotaExceeded[modelName] = &now
-				c.SetModelQuotaExceeded(modelName)
-			}
-			errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: genErr}
-			return
-		}
+        cleaned := sanitizeAssistantMessages(messages)
+        meta, reuseIdx := c.findReusableMetadata(modelName, cleaned)
+        useTags := needRoleTags(messages)
+        if reuseIdx > 0 && len(messages[reuseIdx:]) == 1 && strings.ToLower(messages[reuseIdx].Role) == "user" {
+            useTags = false
+        }
+        prompt := buildPrompt(messages[reuseIdx:], useTags, useTags)
+
+        // Call upstream Gemini App with splitting if needed
+        output, genErr := c.sendWithSplit(ctx, modelName, prompt, meta, uploadedFiles...)
+        if genErr != nil {
+            status := 500
+            switch {
+            case errors.Is(genErr, errGeminiUsageLimitExceeded), errors.Is(genErr, errGeminiTemporarilyBlocked):
+                status = 429
+            case errors.Is(genErr, errGeminiModelInconsistent), errors.Is(genErr, errGeminiModelInvalid):
+                status = 400
+            }
+            if status == 429 {
+                now := time.Now()
+                c.modelQuotaExceeded[modelName] = &now
+                c.SetModelQuotaExceeded(modelName)
+            }
+            errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: genErr}
+            return
+        }
 
 		// Clear quota status on success
 		delete(c.modelQuotaExceeded, modelName)
 		c.ClearModelQuotaExceeded(modelName)
 
-		// Convert to Gemini response JSON first
-		gemBytes, errMsg := c.convertOutputToGemini(output, modelName)
-		if errMsg != nil {
-			errChan <- errMsg
-			return
-		}
+        // Convert to Gemini response JSON first
+        gemBytes, errMsg := c.convertOutputToGemini(output, modelName)
+        if errMsg != nil {
+            errChan <- errMsg
+            return
+        }
 
-		// Log upstream-like response
-		c.AddAPIResponseData(ctx, gemBytes)
+        // Log upstream-like response
+        c.AddAPIResponseData(ctx, gemBytes)
+
+        if output != nil && len(output.Metadata) > 0 && len(output.Candidates) > 0 {
+            c.storeConversation(modelName, cleaned, output.Candidates[0].Text, output.Metadata)
+        }
 
 		// If handler expects another format (e.g. OpenAI/Claude/GeminiCLI),
 		// simulate streaming by emitting Gemini-shaped chunks and translating each chunk.
@@ -278,10 +316,10 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
 			simulateTranslatedStreaming(ctx, dataChan, handlerType, c.Type(), modelName, originalRequestRawJSON, rawJSON, output)
 			return
 		}
-		// Otherwise (Gemini->Gemini passthrough), simulate streaming like docs/gemini-fastapi
-		// by splitting the final text into small chunks and emitting Gemini-shaped JSON.
-		simulateGeminiStreaming(dataChan, modelName, output)
-	}()
+        // Otherwise (Gemini->Gemini passthrough), simulate streaming like docs/gemini-fastapi
+        // by splitting the final text into small chunks and emitting Gemini-shaped JSON.
+        simulateGeminiStreaming(dataChan, modelName, output)
+    }()
 
 	return dataChan, errChan
 }
@@ -619,34 +657,193 @@ func (c *GeminiAppClient) setHeaders(req *http.Request, modelName string) {
 }
 
 func (c *GeminiAppClient) extractRequestData(rawJSON []byte) (string, [][]byte, []string, error) {
-	var prompt strings.Builder
-	var files [][]byte
-	var mimes []string
+    msgs, files, mimes, err := c.parseMessagesAndFiles(rawJSON)
+    if err != nil {
+        return "", nil, nil, err
+    }
+    useTags := needRoleTags(msgs)
+    prompt := buildPrompt(msgs, useTags, useTags)
+    return prompt, files, mimes, nil
+}
 
-	contents := gjson.GetBytes(rawJSON, "contents")
-	if contents.Exists() {
-		contents.ForEach(func(_, content gjson.Result) bool {
-			content.Get("parts").ForEach(func(_, part gjson.Result) bool {
-				if text := part.Get("text"); text.Exists() {
-					prompt.WriteString(text.String())
-					prompt.WriteString("\n")
-				}
-				if inlineData := part.Get("inlineData"); inlineData.Exists() {
-					data := inlineData.Get("data").String()
-					b, err := base64.StdEncoding.DecodeString(data)
-					if err == nil {
-						files = append(files, b)
-						m := inlineData.Get("mime_type").String()
-						mimes = append(mimes, m)
-					}
-				}
-				return true
-			})
-			return true
-		})
-	}
+type roleText struct {
+    Role string
+    Text string
+}
 
-	return strings.TrimSpace(prompt.String()), files, mimes, nil
+func (c *GeminiAppClient) parseMessagesAndFiles(rawJSON []byte) ([]roleText, [][]byte, []string, error) {
+    var messages []roleText
+    var files [][]byte
+    var mimes []string
+
+    contents := gjson.GetBytes(rawJSON, "contents")
+    if contents.Exists() {
+        contents.ForEach(func(_, content gjson.Result) bool {
+            role := strings.ToLower(content.Get("role").String())
+            var b strings.Builder
+            content.Get("parts").ForEach(func(_, part gjson.Result) bool {
+                if text := part.Get("text"); text.Exists() {
+                    if b.Len() > 0 {
+                        b.WriteString("\n")
+                    }
+                    b.WriteString(text.String())
+                }
+                if inlineData := part.Get("inlineData"); inlineData.Exists() {
+                    data := inlineData.Get("data").String()
+                    if data != "" {
+                        if dec, err := base64.StdEncoding.DecodeString(data); err == nil {
+                            files = append(files, dec)
+                            m := inlineData.Get("mime_type").String()
+                            mimes = append(mimes, m)
+                        }
+                    }
+                }
+                return true
+            })
+            messages = append(messages, roleText{Role: role, Text: b.String()})
+            return true
+        })
+    }
+    return messages, files, mimes, nil
+}
+
+func needRoleTags(msgs []roleText) bool {
+    for _, m := range msgs {
+        if strings.ToLower(m.Role) != "user" {
+            return true
+        }
+    }
+    return false
+}
+
+func addRoleTag(role, content string, unclose bool) string {
+    if role == "" {
+        role = "user"
+    }
+    if unclose {
+        return "<|im_start|>" + role + "\n" + content
+    }
+    return "<|im_start|>" + role + "\n" + content + "\n<|im_end|>"
+}
+
+func buildPrompt(msgs []roleText, tagged bool, appendAssistant bool) string {
+    if len(msgs) == 0 {
+        if tagged && appendAssistant {
+            return addRoleTag("assistant", "", true)
+        }
+        return ""
+    }
+    if !tagged {
+        var sb strings.Builder
+        for i, m := range msgs {
+            if i > 0 {
+                sb.WriteString("\n")
+            }
+            sb.WriteString(m.Text)
+        }
+        return sb.String()
+    }
+    var sb strings.Builder
+    for _, m := range msgs {
+        sb.WriteString(addRoleTag(m.Role, m.Text, false))
+        sb.WriteString("\n")
+    }
+    if appendAssistant {
+        sb.WriteString(addRoleTag("assistant", "", true))
+    }
+    return strings.TrimSpace(sb.String())
+}
+
+var reThink = regexp.MustCompile(`(?s)^\s*<think>.*?</think>\s*`)
+
+func removeThinkTags(s string) string {
+    return strings.TrimSpace(reThink.ReplaceAllString(s, ""))
+}
+
+func sanitizeAssistantMessages(msgs []roleText) []roleText {
+    out := make([]roleText, 0, len(msgs))
+    for _, m := range msgs {
+        if strings.ToLower(m.Role) == "assistant" {
+            out = append(out, roleText{Role: m.Role, Text: removeThinkTags(m.Text)})
+        } else {
+            out = append(out, m)
+        }
+    }
+    return out
+}
+
+func (c *GeminiAppClient) conversationKey(modelName string, msgs []roleText) string {
+    norm := make([]map[string]string, 0, len(msgs))
+    for _, m := range msgs {
+        t := m.Text
+        if strings.ToLower(m.Role) == "assistant" {
+            t = removeThinkTags(t)
+        }
+        norm = append(norm, map[string]string{"r": strings.ToLower(m.Role), "t": t})
+    }
+    b, _ := json.Marshal(norm)
+    sum := sha256.Sum256(b)
+    return fmt.Sprintf("%s|%s|%s", modelName, c.GetEmail(), hex.EncodeToString(sum[:]))
+}
+
+func (c *GeminiAppClient) findReusableMetadata(modelName string, msgs []roleText) ([]string, int) {
+    if len(msgs) < 2 {
+        return nil, 0
+    }
+    for end := len(msgs); end >= 2; end-- {
+        if r := strings.ToLower(msgs[end-1].Role); r != "assistant" && r != "system" {
+            continue
+        }
+        key := c.conversationKey(modelName, msgs[:end])
+        c.convMutex.RLock()
+        meta, ok := c.convStore[key]
+        c.convMutex.RUnlock()
+        if ok && len(meta) > 0 {
+            return meta, end
+        }
+    }
+    return nil, 0
+}
+
+func (c *GeminiAppClient) storeConversation(modelName string, msgs []roleText, assistantReply string, metadata []string) {
+    all := make([]roleText, 0, len(msgs)+1)
+    all = append(all, msgs...)
+    all = append(all, roleText{Role: "assistant", Text: removeThinkTags(assistantReply)})
+    key := c.conversationKey(modelName, all)
+    c.convMutex.Lock()
+    c.convStore[key] = metadata
+    c.convMutex.Unlock()
+}
+
+func (c *GeminiAppClient) sendWithSplit(ctx context.Context, modelName, prompt string, metadata []string, files ...*UploadedFile) (*ModelOutput, error) {
+    rlen := func(s string) int { return len([]rune(s)) }
+    if rlen(prompt) <= geminiAppMaxChars {
+        return c.generateContent(ctx, modelName, prompt, metadata, "", files...)
+    }
+    hintLen := rlen(geminiAppContHint)
+    chunkSize := geminiAppMaxChars - hintLen
+    if chunkSize <= 0 {
+        chunkSize = geminiAppMaxChars
+    }
+    chunks := chunkByRunes(prompt, chunkSize)
+    if len(chunks) == 0 {
+        return c.generateContent(ctx, modelName, prompt, metadata, "", files...)
+    }
+    currentMeta := metadata
+    for i := 0; i < len(chunks)-1; i++ {
+        tmpOut, err := c.generateContent(ctx, modelName, chunks[i]+geminiAppContHint, currentMeta, "")
+        if err != nil {
+            return nil, err
+        }
+        if tmpOut != nil && len(tmpOut.Metadata) > 0 {
+            currentMeta = tmpOut.Metadata
+        }
+    }
+    out, err := c.generateContent(ctx, modelName, chunks[len(chunks)-1], currentMeta, "", files...)
+    if err != nil {
+        return nil, err
+    }
+    return out, nil
 }
 
 func (c *GeminiAppClient) uploadFile(filePath string) (*UploadedFile, error) {
@@ -758,7 +955,7 @@ func (c *GeminiAppClient) uploadInlineFiles(files [][]byte, mimes []string) ([]*
 	return uploaded, nil
 }
 
-func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt, gemID string, files ...*UploadedFile) (*ModelOutput, error) {
+func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt string, metadata []string, gemID string, files ...*UploadedFile) (*ModelOutput, error) {
 	var innerPayload []interface{}
 	if len(files) > 0 {
 		var fileList []interface{}
@@ -770,13 +967,16 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 		innerPayload = []interface{}{prompt}
 	}
 
-	stringifiedPayload := []interface{}{innerPayload, nil, nil}
-	if gemID != "" {
-		for i := 0; i < 16; i++ {
-			stringifiedPayload = append(stringifiedPayload, nil)
-		}
-		stringifiedPayload = append(stringifiedPayload, gemID)
-	}
+    stringifiedPayload := []interface{}{innerPayload, nil, nil}
+    if len(metadata) > 0 {
+        stringifiedPayload[2] = metadata
+    }
+    if gemID != "" {
+        for i := 0; i < 16; i++ {
+            stringifiedPayload = append(stringifiedPayload, nil)
+        }
+        stringifiedPayload = append(stringifiedPayload, gemID)
+    }
 
 	jsonPayload, err := json.Marshal(stringifiedPayload)
 	if err != nil {
@@ -834,27 +1034,42 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 		return nil, fmt.Errorf("failed to find valid JSON data in response: %s", string(body))
 	}
 
-	var textBuilder strings.Builder
-	var thoughtsBuilder strings.Builder
-	foundAnyText := false
-	for _, part := range responseData {
-		if len(part) < 3 {
-			continue
-		}
-		mainPartStr, ok := part[2].(string)
-		if !ok {
-			continue
-		}
-		var mainPart []interface{}
-		if err := json.Unmarshal([]byte(mainPartStr), &mainPart); err != nil {
-			continue
-		}
+    var textBuilder strings.Builder
+    var thoughtsBuilder strings.Builder
+    var respMetadata []string
+    foundAnyText := false
+    for _, part := range responseData {
+        if len(part) < 3 {
+            continue
+        }
+        mainPartStr, ok := part[2].(string)
+        if !ok {
+            continue
+        }
+        var mainPart []interface{}
+        if err := json.Unmarshal([]byte(mainPartStr), &mainPart); err != nil {
+            continue
+        }
 
-		if len(mainPart) > 4 && mainPart[4] != nil {
-			candidatesData, _ := mainPart[4].([]interface{})
-			for _, candData := range candidatesData {
-				candList, _ := candData.([]interface{})
-				if len(candList) > 1 {
+        if len(mainPart) > 1 && mainPart[1] != nil && respMetadata == nil {
+            if mdSlice, ok := mainPart[1].([]interface{}); ok {
+                tmp := make([]string, 0, len(mdSlice))
+                for _, v := range mdSlice {
+                    if s, ok := v.(string); ok {
+                        tmp = append(tmp, s)
+                    }
+                }
+                if len(tmp) > 0 {
+                    respMetadata = tmp
+                }
+            }
+        }
+
+        if len(mainPart) > 4 && mainPart[4] != nil {
+            candidatesData, _ := mainPart[4].([]interface{})
+            for _, candData := range candidatesData {
+                candList, _ := candData.([]interface{})
+                if len(candList) > 1 {
 					// Extract thoughts at [37][0][0] if present
 					if len(candList) > 37 {
 						if arr1, ok := candList[37].([]interface{}); ok && len(arr1) > 0 {
@@ -900,11 +1115,12 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 		return nil, errGeminiAPI
 	}
 
-	return &ModelOutput{
-		Candidates: []Candidate{
-			{Text: textBuilder.String(), Thoughts: strings.TrimSpace(thoughtsBuilder.String())},
-		},
-	}, nil
+    return &ModelOutput{
+        Candidates: []Candidate{
+            {Text: textBuilder.String(), Thoughts: strings.TrimSpace(thoughtsBuilder.String())},
+        },
+        Metadata: respMetadata,
+    }, nil
 }
 
 // Helper functions for minimal nested slice traversal (error code extraction)
