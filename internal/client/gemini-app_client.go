@@ -1,4 +1,4 @@
-package client
+﻿package client
 
 import (
     "bytes"
@@ -80,19 +80,8 @@ func NewGeminiAppClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, to
 
 	log.Debugf("Cookie Jar Content: %+v", jar.Cookies(cookieURL))
 
-	transport := &http.Transport{}
-	if cfg.ProxyURL != "" {
-		proxyURL, err := url.Parse(cfg.ProxyURL)
-		if err != nil {
-			return nil, fmt.Errorf("invalid proxy URL: %w", err)
-		}
-		transport.Proxy = http.ProxyURL(proxyURL)
-	}
-
-	httpClient := &http.Client{
-		Jar:       jar,
-		Transport: transport,
-	}
+    // Build HTTP client with shared proxy handling (supports socks5/http/https)
+    httpClient := util.SetProxy(cfg, &http.Client{Jar: jar})
 
 	clientID := fmt.Sprintf("gemini-app-%s-%d", ts.Secure1PSID[:8], time.Now().UnixNano())
 	client := &GeminiAppClient{
@@ -153,14 +142,15 @@ func (c *GeminiAppClient) SendRawMessage(ctx context.Context, modelName string, 
             ginContext.Set("API_REQUEST", rawJSON)
         }
     }
-    prompt, files, err := c.extractRequestData(rawJSON)
+    prompt, files, mimes, err := c.extractRequestData(rawJSON)
     if err != nil {
         return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
     }
 
 	var uploadedFiles []*UploadedFile
-	for _, fileData := range files {
-		tmpfile, err := os.CreateTemp("", "gemini-upload-*.jpg")
+    for i, fileData := range files {
+        ext := mimeToExt(mimes, i)
+        tmpfile, err := os.CreateTemp("", "gemini-upload-*"+ext)
 		if err != nil {
 			return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to create temp file: %w", err)}
 		}
@@ -189,10 +179,18 @@ func (c *GeminiAppClient) SendRawMessage(ctx context.Context, modelName string, 
         case errors.Is(err, errGeminiModelInconsistent), errors.Is(err, errGeminiModelInvalid):
             status = 400
         }
+        if status == 429 {
+            now := time.Now()
+            c.modelQuotaExceeded[modelName] = &now
+            c.SetModelQuotaExceeded(modelName)
+        }
         return nil, &interfaces.ErrorMessage{StatusCode: status, Error: err}
     }
 
-	return c.convertOutputToV1Beta(output, modelName)
+    // Clear quota status on success
+    delete(c.modelQuotaExceeded, modelName)
+    c.ClearModelQuotaExceeded(modelName)
+    return c.convertOutputToV1Beta(output, modelName)
 }
 
 func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName string, rawJSON []byte, alt string) (<-chan []byte, <-chan *interfaces.ErrorMessage) {
@@ -216,15 +214,16 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
         }
 
         // Build prompt/files and upload inline files if any
-        prompt, files, err := c.extractRequestData(rawJSON)
+        prompt, files, mimes, err := c.extractRequestData(rawJSON)
         if err != nil {
             errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
             return
         }
 
         var uploadedFiles []*UploadedFile
-        for _, fileData := range files {
-            tmpfile, e := os.CreateTemp("", "gemini-upload-*.bin")
+        for i, fileData := range files {
+            ext := mimeToExt(mimes, i)
+            tmpfile, e := os.CreateTemp("", "gemini-upload-*"+ext)
             if e != nil {
                 errChan <- &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to create temp file: %w", e)}
                 return
@@ -250,11 +249,20 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
             case errors.Is(genErr, errGeminiModelInconsistent), errors.Is(genErr, errGeminiModelInvalid):
                 status = 400
             }
+            if status == 429 {
+                now := time.Now()
+                c.modelQuotaExceeded[modelName] = &now
+                c.SetModelQuotaExceeded(modelName)
+            }
             errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: genErr}
             return
         }
 
-        // Build minimal OpenAI chat.completion.chunk stream
+        // Clear quota status on success
+        delete(c.modelQuotaExceeded, modelName)
+        c.ClearModelQuotaExceeded(modelName)
+
+        // Build minimal OpenAI chat.completion.chunk stream (JSON only)
         // 1) role chunk
         created := time.Now().Unix()
         id := fmt.Sprintf("%d-%s", created, "gemini-app")
@@ -281,8 +289,7 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
             id, created, modelName, mustJSONMarshalString(content))
         dataChan <- []byte(finalChunk)
 
-        // 4) [DONE]
-        dataChan <- []byte("[DONE]")
+        // 4) Stream complete; handler will emit final [DONE]
     }()
 
     return dataChan, errChan
@@ -313,6 +320,30 @@ func splitReasoningSegments(s string) []string {
         }
     }
     return out
+}
+
+// mimeToExt maps common MIME types to file extensions.
+// Falls back to .png which works for most simple images.
+func mimeToExt(mimes []string, i int) string {
+    if i < len(mimes) {
+        switch strings.ToLower(mimes[i]) {
+        case "image/png":
+            return ".png"
+        case "image/jpeg", "image/jpg":
+            return ".jpg"
+        case "image/webp":
+            return ".webp"
+        case "image/gif":
+            return ".gif"
+        case "image/bmp":
+            return ".bmp"
+        case "image/heic":
+            return ".heic"
+        case "application/pdf":
+            return ".pdf"
+        }
+    }
+    return ".png"
 }
 
 func (c *GeminiAppClient) SendRawTokenCount(ctx context.Context, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
@@ -454,9 +485,10 @@ func (c *GeminiAppClient) setHeaders(req *http.Request, modelName string) {
 	req.Header.Set("x-goog-ext-525001261-jspb", modelHeader)
 }
 
-func (c *GeminiAppClient) extractRequestData(rawJSON []byte) (string, [][]byte, error) {
-	var prompt strings.Builder
-	var files [][]byte
+func (c *GeminiAppClient) extractRequestData(rawJSON []byte) (string, [][]byte, []string, error) {
+    var prompt strings.Builder
+    var files [][]byte
+    var mimes []string
 
 	contents := gjson.GetBytes(rawJSON, "contents")
 	if contents.Exists() {
@@ -466,20 +498,22 @@ func (c *GeminiAppClient) extractRequestData(rawJSON []byte) (string, [][]byte, 
 					prompt.WriteString(text.String())
 					prompt.WriteString("\n")
 				}
-				if inlineData := part.Get("inlineData"); inlineData.Exists() {
-					data := inlineData.Get("data").String()
-					b, err := base64.StdEncoding.DecodeString(data)
-					if err == nil {
-						files = append(files, b)
-					}
-				}
+                if inlineData := part.Get("inlineData"); inlineData.Exists() {
+                    data := inlineData.Get("data").String()
+                    b, err := base64.StdEncoding.DecodeString(data)
+                    if err == nil {
+                        files = append(files, b)
+                        m := inlineData.Get("mime_type").String()
+                        mimes = append(mimes, m)
+                    }
+                }
 				return true
 			})
 			return true
 		})
 	}
 
-	return strings.TrimSpace(prompt.String()), files, nil
+    return strings.TrimSpace(prompt.String()), files, mimes, nil
 }
 
 func (c *GeminiAppClient) uploadFile(filePath string) (*UploadedFile, error) {
