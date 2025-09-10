@@ -70,9 +70,11 @@ type GeminiAppClient struct {
     cookies       []*http.Cookie
     tokenFilePath string
 
-	// in-memory conversation store: key -> metadata
-	convStore map[string][]string
-	convMutex sync.RWMutex
+    // in-memory conversation store: key -> metadata
+    convStore map[string][]string
+    convMutex sync.RWMutex
+
+	cookieRotationStarted bool
 }
 
 func NewGeminiAppClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, tokenFilePath string) (*GeminiAppClient, error) {
@@ -111,12 +113,14 @@ func NewGeminiAppClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, to
 	client.InitializeModelRegistry(clientID)
 	client.RegisterModels(GEMINI, registry.GetGeminiModels())
 
-	// Fetch initial access token
-	if err := client.Init(); err != nil {
-		return nil, fmt.Errorf("failed to initialize gemini-app client: %w", err)
-	}
-
-	go client.startCookieRotation()
+    // Try initial access token, but do not fail the whole program if it fails
+    if err := client.Init(); err != nil {
+        log.Warnf("Gemini App initial token fetch failed for %s: %v. Will retry in background.", client.GetEmail(), err)
+        go client.backgroundInitRetry()
+    } else {
+        client.cookieRotationStarted = true
+        go client.startCookieRotation()
+    }
 
 	return client, nil
 }
@@ -587,8 +591,8 @@ func (c *GeminiAppClient) rotateCookies() error {
 }
 
 func (c *GeminiAppClient) startCookieRotation() {
-	ticker := time.NewTicker(2 * time.Hour)
-	defer ticker.Stop()
+    ticker := time.NewTicker(2 * time.Hour)
+    defer ticker.Stop()
 
 	for {
 		<-ticker.C
@@ -664,6 +668,26 @@ func (c *GeminiAppClient) extractRequestData(rawJSON []byte) (string, [][]byte, 
     useTags := needRoleTags(msgs)
     prompt := buildPrompt(msgs, useTags, useTags)
     return prompt, files, mimes, nil
+}
+
+func (c *GeminiAppClient) backgroundInitRetry() {
+    backoffs := []time.Duration{5 * time.Second, 10 * time.Second, 30 * time.Second, 1 * time.Minute, 2 * time.Minute, 5 * time.Minute}
+    i := 0
+    for {
+        if err := c.refreshAccessToken(); err == nil {
+            log.Infof("Gemini App token recovered for %s", c.GetEmail())
+            if !c.cookieRotationStarted {
+                c.cookieRotationStarted = true
+                go c.startCookieRotation()
+            }
+            return
+        }
+        d := backoffs[i]
+        if i < len(backoffs)-1 {
+            i++
+        }
+        time.Sleep(d)
+    }
 }
 
 type roleText struct {
@@ -956,6 +980,12 @@ func (c *GeminiAppClient) uploadInlineFiles(files [][]byte, mimes []string) ([]*
 }
 
 func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt string, metadata []string, gemID string, files ...*UploadedFile) (*ModelOutput, error) {
+    // Ensure access token exists; try to refresh if missing
+    if strings.TrimSpace(c.accessToken) == "" {
+        if err := c.refreshAccessToken(); err != nil {
+            return nil, fmt.Errorf("access token unavailable: %w", err)
+        }
+    }
 	var innerPayload []interface{}
 	if len(files) > 0 {
 		var fileList []interface{}
@@ -983,14 +1013,16 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 		return nil, err
 	}
 
-	fReq, err := json.Marshal([]interface{}{nil, string(jsonPayload)})
-	if err != nil {
-		return nil, err
-	}
+    fReq, err := json.Marshal([]interface{}{nil, string(jsonPayload)})
+    if err != nil {
+        return nil, err
+    }
 
-	data := url.Values{}
-	data.Set("at", c.accessToken)
-	data.Set("f.req", string(fReq))
+    data := url.Values{}
+    data.Set("at", c.accessToken)
+    data.Set("f.req", string(fReq))
+
+    var responseData [][]interface{}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", geminiAppGenerate, strings.NewReader(data.Encode()))
 	if err != nil {
@@ -1001,38 +1033,78 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 
 	log.Debugf("Use Gemini App account %s for model %s", c.GetEmail(), modelName)
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+    resp, err := c.httpClient.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		// Log upstream API response even on error
-		c.AddAPIResponseData(ctx, body)
-		return nil, fmt.Errorf("API request failed with status code %d: %s", resp.StatusCode, string(body))
-	}
+    if resp.StatusCode != http.StatusOK {
+        // Try one refresh-and-retry in case token got invalidated
+        body, _ := io.ReadAll(resp.Body)
+        c.AddAPIResponseData(ctx, body)
+        if err := c.refreshAccessToken(); err == nil {
+            req2, err2 := http.NewRequestWithContext(ctx, "POST", geminiAppGenerate, strings.NewReader(data.Encode()))
+            if err2 != nil {
+                return nil, err2
+            }
+            c.setHeaders(req2, modelName)
+            resp2, err2 := c.httpClient.Do(req2)
+            if err2 == nil {
+                defer resp2.Body.Close()
+                if resp2.StatusCode == http.StatusOK {
+                    body2, err2 := io.ReadAll(resp2.Body)
+                    if err2 != nil {
+                        return nil, err2
+                    }
+                    c.AddAPIResponseData(ctx, body2)
+                    responseDataRetry, perr := func(b []byte) ([][]interface{}, error) {
+                        lines := strings.Split(string(b), "\n")
+                        var rd [][]interface{}
+                        for _, line := range lines {
+                            if strings.HasPrefix(line, "[[") {
+                                if err := json.Unmarshal([]byte(line), &rd); err == nil {
+                                    return rd, nil
+                                }
+                            }
+                        }
+                        return nil, fmt.Errorf("failed to find valid JSON data in response: %s", string(b))
+                    }(body2)
+                    if perr != nil {
+                        return nil, perr
+                    }
+                    // assign and continue parsing with unified logic below
+                    responseData = responseDataRetry
+                }
+            }
+        }
+        return nil, fmt.Errorf("API request failed with status code %d: %s", resp.StatusCode, string(body))
+    }
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	// Log upstream API response body for request logger
-	c.AddAPIResponseData(ctx, body)
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return nil, err
+    }
+    // Log upstream API response body for request logger
+    c.AddAPIResponseData(ctx, body)
 
-	lines := strings.Split(string(body), "\n")
-	var responseData [][]interface{}
-	for _, line := range lines {
-		if strings.HasPrefix(line, "[[") {
-			if err := json.Unmarshal([]byte(line), &responseData); err == nil {
-				break
-			}
-		}
-	}
-	if responseData == nil {
-		return nil, fmt.Errorf("failed to find valid JSON data in response: %s", string(body))
-	}
+    parseResp := func(b []byte) ([][]interface{}, error) {
+        lines := strings.Split(string(b), "\n")
+        var rd [][]interface{}
+        for _, line := range lines {
+            if strings.HasPrefix(line, "[[") {
+                if err := json.Unmarshal([]byte(line), &rd); err == nil {
+                    return rd, nil
+                }
+            }
+        }
+        return nil, fmt.Errorf("failed to find valid JSON data in response: %s", string(b))
+    }
+    rd, err := parseResp(body)
+    if err != nil {
+        return nil, err
+    }
+    responseData = rd
 
     var textBuilder strings.Builder
     var thoughtsBuilder strings.Builder
