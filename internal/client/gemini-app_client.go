@@ -307,8 +307,8 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
         // Log upstream-like response
         c.AddAPIResponseData(ctx, gemBytes)
 
-        // If handler expects another format (e.g. OpenAI), leverage translator
-        if translator.NeedConvert(handlerType, c.Type()) {
+        // If handler expects another format (e.g. OpenAI/Claude/GeminiCLI), leverage translator
+        if translator.NeedConvert(handlerType, c.Type()) && handlerType != GEMINI {
             var param any
             lines := translator.Response(handlerType, c.Type(), ctx, modelName, originalRequestRawJSON, rawJSON, gemBytes, &param)
             for i := 0; i < len(lines); i++ {
@@ -321,8 +321,9 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
             }
             return
         }
-        // Otherwise, stream Gemini JSON as a single chunk; handler will handle [DONE]
-        dataChan <- gemBytes
+        // Otherwise (Gemini->Gemini passthrough), simulate streaming like docs/gemini-fastapi
+        // by splitting the final text into small chunks and emitting Gemini-shaped JSON.
+        simulateGeminiStreaming(dataChan, modelName, output)
     }()
 
     return dataChan, errChan
@@ -353,6 +354,107 @@ func splitReasoningSegments(s string) []string {
         }
     }
     return out
+}
+
+// chunkByRunes splits a string into rune-safe chunks of up to size runes.
+func chunkByRunes(s string, size int) []string {
+    if size <= 0 {
+        return []string{s}
+    }
+    chunks := make([]string, 0, (len(s)/size)+1)
+    var buf strings.Builder
+    count := 0
+    for _, r := range s {
+        buf.WriteRune(r)
+        count++
+        if count >= size {
+            chunks = append(chunks, buf.String())
+            buf.Reset()
+            count = 0
+        }
+    }
+    if buf.Len() > 0 {
+        chunks = append(chunks, buf.String())
+    }
+    if len(chunks) == 0 {
+        return []string{""}
+    }
+    return chunks
+}
+
+// simulateGeminiStreaming emits SSE-friendly JSON chunks in a Gemini-like shape.
+// It mirrors docs/gemini-fastapi behavior: send small text pieces as sequential events
+// and include finish information in the final event. Token usage is not available here,
+// so it falls back to zeros.
+func simulateGeminiStreaming(out chan<- []byte, modelName string, output *ModelOutput) {
+    if output == nil || len(output.Candidates) == 0 {
+        // Nothing to stream
+        return
+    }
+
+    // Compose full text: include thoughts first if present (like fastapi extract_output)
+    fullText := ""
+    if t := strings.TrimSpace(output.Candidates[0].Thoughts); t != "" {
+        fullText += "<think>" + t + "</think>\n"
+    }
+    fullText += output.Candidates[0].Text
+
+    // Use a conservative small chunk size to deliver a smooth stream.
+    // Count by runes to avoid splitting multi-byte characters.
+    const chunkSize = 32
+    chunks := chunkByRunes(fullText, chunkSize)
+
+    // Helper to build a Gemini-shaped response with a single text part
+    buildChunk := func(text string, finish *string, includeUsage bool) []byte {
+        parts := []map[string]any{}
+        if text != "" {
+            parts = append(parts, map[string]any{"text": text})
+        }
+        resp := map[string]any{
+            "candidates": []any{
+                map[string]any{
+                    "content": map[string]any{
+                        "parts": parts,
+                        "role":  "model",
+                    },
+                    "index": 0,
+                },
+            },
+            "createTime":   time.Now().Format(time.RFC3339Nano),
+            "responseId":   fmt.Sprintf("gemini-app-%d", time.Now().UnixNano()),
+            "modelVersion": modelName,
+        }
+        if finish != nil {
+            // Set finishReason on candidate[0]
+            cand := resp["candidates"].([]any)[0].(map[string]any)
+            cand["finishReason"] = *finish
+        }
+        if includeUsage {
+            resp["usageMetadata"] = map[string]any{
+                "promptTokenCount":     0,
+                "candidatesTokenCount": 0,
+                "totalTokenCount":      0,
+            }
+        }
+        b, _ := json.Marshal(resp)
+        return b
+    }
+
+    // Send an initial role event (empty delta) to align with some client expectations
+    out <- buildChunk("", nil, false)
+
+    // Stream content chunks
+    for i := 0; i < len(chunks); i++ {
+        last := i == len(chunks)-1
+        if last {
+            // Final chunk: no text delta (to avoid duplicate text in some clients),
+            // send finish + usage. Then send a closing empty event to clearly delimit end.
+            finish := "STOP"
+            out <- buildChunk("", &finish, true)
+        } else {
+            out <- buildChunk(chunks[i], nil, false)
+        }
+    }
 }
 
 // mimeToExt maps common MIME types to file extensions.
