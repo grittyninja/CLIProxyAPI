@@ -307,18 +307,10 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
         // Log upstream-like response
         c.AddAPIResponseData(ctx, gemBytes)
 
-        // If handler expects another format (e.g. OpenAI/Claude/GeminiCLI), leverage translator
+        // If handler expects another format (e.g. OpenAI/Claude/GeminiCLI),
+        // simulate streaming by emitting Gemini-shaped chunks and translating each chunk.
         if translator.NeedConvert(handlerType, c.Type()) && handlerType != GEMINI {
-            var param any
-            lines := translator.Response(handlerType, c.Type(), ctx, modelName, originalRequestRawJSON, rawJSON, gemBytes, &param)
-            for i := 0; i < len(lines); i++ {
-                dataChan <- []byte(lines[i])
-            }
-            // Emit final [DONE] translated events (usage/finalization) if any
-            doneLines := translator.Response(handlerType, c.Type(), ctx, modelName, rawJSON, originalRequestRawJSON, []byte("[DONE]"), &param)
-            for i := 0; i < len(doneLines); i++ {
-                dataChan <- []byte(doneLines[i])
-            }
+            simulateTranslatedStreaming(ctx, dataChan, handlerType, c.Type(), modelName, originalRequestRawJSON, rawJSON, output)
             return
         }
         // Otherwise (Gemini->Gemini passthrough), simulate streaming like docs/gemini-fastapi
@@ -453,6 +445,100 @@ func simulateGeminiStreaming(out chan<- []byte, modelName string, output *ModelO
             out <- buildChunk("", &finish, true)
         } else {
             out <- buildChunk(chunks[i], nil, false)
+        }
+    }
+}
+
+// simulateTranslatedStreaming splits the final output into Gemini-shaped chunks,
+// translates each chunk into the target handler format (e.g., OpenAI Chat Completions),
+// and pushes them to dataChan one by one.
+func simulateTranslatedStreaming(
+    ctx context.Context,
+    dataChan chan<- []byte,
+    handlerType string,
+    providerType string,
+    modelName string,
+    originalRequestRawJSON []byte,
+    requestRawJSON []byte,
+    output *ModelOutput,
+) {
+    if output == nil || len(output.Candidates) == 0 {
+        return
+    }
+
+    // Prepare full text similar to simulateGeminiStreaming
+    fullText := ""
+    if t := strings.TrimSpace(output.Candidates[0].Thoughts); t != "" {
+        fullText += "<think>" + t + "</think>\n"
+    }
+    fullText += output.Candidates[0].Text
+
+    const chunkSize = 32
+    chunks := chunkByRunes(fullText, chunkSize)
+
+    // Helper to build a Gemini-shaped response chunk
+    buildChunk := func(text string, finish *string, includeUsage bool) []byte {
+        parts := []map[string]any{}
+        if text != "" {
+            parts = append(parts, map[string]any{"text": text})
+        }
+        resp := map[string]any{
+            "candidates": []any{
+                map[string]any{
+                    "content": map[string]any{
+                        "parts": parts,
+                        "role":  "model",
+                    },
+                    "index": 0,
+                },
+            },
+            "createTime":   time.Now().Format(time.RFC3339Nano),
+            "responseId":   fmt.Sprintf("gemini-app-%d", time.Now().UnixNano()),
+            "modelVersion": modelName,
+        }
+        if finish != nil {
+            cand := resp["candidates"].([]any)[0].(map[string]any)
+            cand["finishReason"] = *finish
+        }
+        if includeUsage {
+            resp["usageMetadata"] = map[string]any{
+                "promptTokenCount":     0,
+                "candidatesTokenCount": 0,
+                "totalTokenCount":      0,
+            }
+        }
+        b, _ := json.Marshal(resp)
+        return b
+    }
+
+    var param any
+    // Optionally send an initial empty chunk to establish role in some translators
+    initLines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk("", nil, false), &param)
+    for _, l := range initLines {
+        if l != "" {
+            dataChan <- []byte(l)
+        }
+    }
+
+    // Stream content chunks
+    for i := 0; i < len(chunks); i++ {
+        last := i == len(chunks)-1
+        if last {
+            // Send final chunk with finish and usage (no delta text to avoid duplication)
+            finish := "stop"
+            endLines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk("", &finish, true), &param)
+            for _, l := range endLines {
+                if l != "" {
+                    dataChan <- []byte(l)
+                }
+            }
+        } else {
+            lines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk(chunks[i], nil, false), &param)
+            for _, l := range lines {
+                if l != "" {
+                    dataChan <- []byte(l)
+                }
+            }
         }
     }
 }
