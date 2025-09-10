@@ -877,7 +877,7 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 
 	c.setHeaders(req, modelName)
 
-	log.Debugf("Making request with Gemini App client: %s", c.GetEmail())
+	log.Debugf("Use Gemini App account %s for model %s", c.GetEmail(), modelName)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
