@@ -152,33 +152,14 @@ func (c *GeminiAppClient) SendRawMessage(ctx context.Context, modelName string, 
 		}
 	}
 
-	// Parse prompt and inline files
+	// Parse prompt and upload inline files (if any)
 	prompt, files, mimes, err := c.extractRequestData(rawJSON)
 	if err != nil {
 		return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
 	}
-
-	// Upload inline files to Google
-	var uploadedFiles []*UploadedFile
-	for i, fileData := range files {
-		ext := mimeToExt(mimes, i)
-		tmpfile, errTmp := os.CreateTemp("", "gemini-upload-*"+ext)
-		if errTmp != nil {
-			return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to create temp file: %w", errTmp)}
-		}
-		// Ensure cleanup
-		defer os.Remove(tmpfile.Name())
-		if _, errWrite := tmpfile.Write(fileData); errWrite != nil {
-			return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to write to temp file: %w", errWrite)}
-		}
-		if errClose := tmpfile.Close(); errClose != nil {
-			return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to close temp file: %w", errClose)}
-		}
-		uploadedFile, errUp := c.uploadFile(tmpfile.Name())
-		if errUp != nil {
-			return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to upload file: %w", errUp)}
-		}
-		uploadedFiles = append(uploadedFiles, uploadedFile)
+	uploadedFiles, upErr := c.uploadInlineFiles(files, mimes)
+	if upErr != nil {
+		return nil, upErr
 	}
 
 	// Perform generation via the web API
@@ -246,30 +227,16 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
 			}
 		}
 
-		// Build prompt/files and upload inline files if any
+		// Build prompt and upload inline files if any
 		prompt, files, mimes, err := c.extractRequestData(rawJSON)
 		if err != nil {
 			errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
 			return
 		}
-
-		var uploadedFiles []*UploadedFile
-		for i, fileData := range files {
-			ext := mimeToExt(mimes, i)
-			tmpfile, e := os.CreateTemp("", "gemini-upload-*"+ext)
-			if e != nil {
-				errChan <- &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to create temp file: %w", e)}
-				return
-			}
-			_, _ = tmpfile.Write(fileData)
-			_ = tmpfile.Close()
-			uploadedFile, e := c.uploadFile(tmpfile.Name())
-			os.Remove(tmpfile.Name())
-			if e != nil {
-				errChan <- &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to upload file: %w", e)}
-				return
-			}
-			uploadedFiles = append(uploadedFiles, uploadedFile)
+		uploadedFiles, upErr := c.uploadInlineFiles(files, mimes)
+		if upErr != nil {
+			errChan <- upErr
+			return
 		}
 
 		// Call upstream Gemini App
@@ -319,33 +286,6 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
 	return dataChan, errChan
 }
 
-// mustJSONMarshalString safely marshals a string into JSON string literal
-func mustJSONMarshalString(s string) string {
-	b, err := json.Marshal(s)
-	if err != nil {
-		esc := strings.ReplaceAll(s, "\"", "\\\"")
-		esc = strings.ReplaceAll(esc, "\n", "\\n")
-		return fmt.Sprintf("\"%s\"", esc)
-	}
-	return string(b)
-}
-
-func splitReasoningSegments(s string) []string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil
-	}
-	parts := strings.Split(s, "\n\n")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
 // chunkByRunes splits a string into rune-safe chunks of up to size runes.
 func chunkByRunes(s string, size int) []string {
 	if size <= 0 {
@@ -376,82 +316,75 @@ func chunkByRunes(s string, size int) []string {
 // It mirrors docs/gemini-fastapi behavior: send small text pieces as sequential events
 // and include finish information in the final event. Token usage is not available here,
 // so it falls back to zeros.
+// buildGeminiChunk builds a Gemini-like JSON chunk for streaming.
+func buildGeminiChunk(modelName, text string, thought bool, finish string, includeFinish, includeUsage bool) []byte {
+	parts := []map[string]any{}
+	if text != "" {
+		part := map[string]any{"text": text}
+		if thought {
+			part["thought"] = true
+		}
+		parts = append(parts, part)
+	}
+	resp := map[string]any{
+		"candidates": []any{
+			map[string]any{
+				"content": map[string]any{"parts": parts, "role": "model"},
+				"index":   0,
+			},
+		},
+		"createTime":   time.Now().Format(time.RFC3339Nano),
+		"responseId":   fmt.Sprintf("gemini-app-%d", time.Now().UnixNano()),
+		"modelVersion": modelName,
+	}
+	if includeFinish {
+		cand := resp["candidates"].([]any)[0].(map[string]any)
+		cand["finishReason"] = finish
+	}
+	if includeUsage {
+		resp["usageMetadata"] = map[string]any{
+			"promptTokenCount":     0,
+			"candidatesTokenCount": 0,
+			"totalTokenCount":      0,
+		}
+	}
+	b, _ := json.Marshal(resp)
+	return b
+}
+
 func simulateGeminiStreaming(out chan<- []byte, modelName string, output *ModelOutput) {
 	if output == nil || len(output.Candidates) == 0 {
 		// Nothing to stream
 		return
 	}
 
-    // Use a conservative small chunk size to deliver a smooth stream.
-    // Count by runes to avoid splitting multi-byte characters.
-    const chunkSize = 32
+	// Use a conservative small chunk size to deliver a smooth stream.
+	// Count by runes to avoid splitting multi-byte characters.
+	const chunkSize = 32
 
-    // Helper to build a Gemini-shaped response with a single text part.
-    // When thought==true, the part is marked as reasoning content for downstream translators.
-    buildChunk := func(text string, thought bool, finish *string, includeUsage bool) []byte {
-        parts := []map[string]any{}
-        if text != "" {
-            part := map[string]any{"text": text}
-            if thought {
-                part["thought"] = true
-            }
-            parts = append(parts, part)
-        }
-        resp := map[string]any{
-            "candidates": []any{
-                map[string]any{
-                    "content": map[string]any{
-                        "parts": parts,
-                        "role":  "model",
-                    },
-                    "index": 0,
-                },
-            },
-            "createTime":   time.Now().Format(time.RFC3339Nano),
-            "responseId":   fmt.Sprintf("gemini-app-%d", time.Now().UnixNano()),
-            "modelVersion": modelName,
-        }
-        if finish != nil {
-            cand := resp["candidates"].([]any)[0].(map[string]any)
-            cand["finishReason"] = *finish
-        }
-        if includeUsage {
-            resp["usageMetadata"] = map[string]any{
-                "promptTokenCount":     0,
-                "candidatesTokenCount": 0,
-                "totalTokenCount":      0,
-            }
-        }
-        b, _ := json.Marshal(resp)
-        return b
-    }
+	// Send an initial role event (empty delta) to align with some client expectations
+	out <- buildGeminiChunk(modelName, "", false, "", false, false)
 
-    // Send an initial role event (empty delta) to align with some client expectations
-    out <- buildChunk("", false, nil, false)
+	// First, stream reasoning/thoughts as dedicated thought chunks if present.
+	if t := strings.TrimSpace(output.Candidates[0].Thoughts); t != "" {
+		for _, ch := range chunkByRunes(t, chunkSize) {
+			out <- buildGeminiChunk(modelName, ch, true, "", false, false)
+		}
+	}
 
-    // First, stream reasoning/thoughts as dedicated thought chunks if present.
-    if t := strings.TrimSpace(output.Candidates[0].Thoughts); t != "" {
-        thoughtChunks := chunkByRunes(t, chunkSize)
-        for _, ch := range thoughtChunks {
-            out <- buildChunk(ch, true, nil, false)
-        }
-    }
+	// Then stream the actual assistant text.
+	text := output.Candidates[0].Text
+	textChunks := chunkByRunes(text, chunkSize)
 
-    // Then stream the actual assistant text.
-    text := output.Candidates[0].Text
-    textChunks := chunkByRunes(text, chunkSize)
-
-    for i := 0; i < len(textChunks); i++ {
-        last := i == len(textChunks)-1
-        if last {
-            // Emit the last text chunk first, then emit a finish event.
-            out <- buildChunk(textChunks[i], false, nil, false)
-            finish := "STOP"
-            out <- buildChunk("", false, &finish, true)
-        } else {
-            out <- buildChunk(textChunks[i], false, nil, false)
-        }
-    }
+	for i := 0; i < len(textChunks); i++ {
+		last := i == len(textChunks)-1
+		if last {
+			out <- buildGeminiChunk(modelName, textChunks[i], false, "", false, false)
+			out <- buildGeminiChunk(modelName, "", false, "STOP", true, true)
+		} else {
+			out <- buildGeminiChunk(modelName, textChunks[i], false, "", false, false)
+		}
+	}
 }
 
 // simulateTranslatedStreaming splits the final output into Gemini-shaped chunks,
@@ -471,98 +404,58 @@ func simulateTranslatedStreaming(
 		return
 	}
 
-    // Prepare chunkers similar to simulateGeminiStreaming, but each chunk is
-    // passed through the translator for the target handler.
-    const chunkSize = 32
-
-    // Helper to build a Gemini-shaped response chunk with optional thought flag
-    buildChunk := func(text string, thought bool, finish *string, includeUsage bool) []byte {
-        parts := []map[string]any{}
-        if text != "" {
-            part := map[string]any{"text": text}
-            if thought {
-                part["thought"] = true
-            }
-            parts = append(parts, part)
-        }
-        resp := map[string]any{
-            "candidates": []any{
-                map[string]any{
-                    "content": map[string]any{
-                        "parts": parts,
-                        "role":  "model",
-                    },
-                    "index": 0,
-                },
-            },
-            "createTime":   time.Now().Format(time.RFC3339Nano),
-            "responseId":   fmt.Sprintf("gemini-app-%d", time.Now().UnixNano()),
-            "modelVersion": modelName,
-        }
-        if finish != nil {
-            cand := resp["candidates"].([]any)[0].(map[string]any)
-            cand["finishReason"] = *finish
-        }
-        if includeUsage {
-            resp["usageMetadata"] = map[string]any{
-                "promptTokenCount":     0,
-                "candidatesTokenCount": 0,
-                "totalTokenCount":      0,
-            }
-        }
-        b, _ := json.Marshal(resp)
-        return b
-    }
+	// Prepare chunkers similar to simulateGeminiStreaming, but each chunk is
+	// passed through the translator for the target handler.
+	const chunkSize = 32
 
 	var param any
 	// Optionally send an initial empty chunk to establish role in some translators
-    initLines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk("", false, nil, false), &param)
-    for _, l := range initLines {
-        if l != "" {
-            dataChan <- []byte(l)
-        }
-    }
+	initLines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildGeminiChunk(modelName, "", false, "", false, false), &param)
+	for _, l := range initLines {
+		if l != "" {
+			dataChan <- []byte(l)
+		}
+	}
 
-    // Stream thought chunks first (as reasoning parts), then main text chunks.
-    if t := strings.TrimSpace(output.Candidates[0].Thoughts); t != "" {
-        for _, ch := range chunkByRunes(t, chunkSize) {
-            lines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk(ch, true, nil, false), &param)
-            for _, l := range lines {
-                if l != "" {
-                    dataChan <- []byte(l)
-                }
-            }
-        }
-    }
+	// Stream thought chunks first (as reasoning parts), then main text chunks.
+	if t := strings.TrimSpace(output.Candidates[0].Thoughts); t != "" {
+		for _, ch := range chunkByRunes(t, chunkSize) {
+			lines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildGeminiChunk(modelName, ch, true, "", false, false), &param)
+			for _, l := range lines {
+				if l != "" {
+					dataChan <- []byte(l)
+				}
+			}
+		}
+	}
 
-    text := output.Candidates[0].Text
-    textChunks := chunkByRunes(text, chunkSize)
-    for i := 0; i < len(textChunks); i++ {
-        last := i == len(textChunks)-1
-        if last {
-            lines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk(textChunks[i], false, nil, false), &param)
-            for _, l := range lines {
-                if l != "" {
-                    dataChan <- []byte(l)
-                }
-            }
+	text := output.Candidates[0].Text
+	textChunks := chunkByRunes(text, chunkSize)
+	for i := 0; i < len(textChunks); i++ {
+		last := i == len(textChunks)-1
+		if last {
+			lines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildGeminiChunk(modelName, textChunks[i], false, "", false, false), &param)
+			for _, l := range lines {
+				if l != "" {
+					dataChan <- []byte(l)
+				}
+			}
 
-            finish := "stop"
-            endLines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk("", false, &finish, true), &param)
-            for _, l := range endLines {
-                if l != "" {
-                    dataChan <- []byte(l)
-                }
-            }
-        } else {
-            lines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk(textChunks[i], false, nil, false), &param)
-            for _, l := range lines {
-                if l != "" {
-                    dataChan <- []byte(l)
-                }
-            }
-        }
-    }
+			endLines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildGeminiChunk(modelName, "", false, "stop", true, true), &param)
+			for _, l := range endLines {
+				if l != "" {
+					dataChan <- []byte(l)
+				}
+			}
+		} else {
+			lines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildGeminiChunk(modelName, textChunks[i], false, "", false, false), &param)
+			for _, l := range lines {
+				if l != "" {
+					dataChan <- []byte(l)
+				}
+			}
+		}
+	}
 }
 
 // mimeToExt maps common MIME types to file extensions.
@@ -601,19 +494,13 @@ func (c *GeminiAppClient) SaveTokenToFile() error {
 }
 
 func (c *GeminiAppClient) IsModelQuotaExceeded(model string) bool {
-	if lastExceededTime, hasKey := c.modelQuotaExceeded[model]; hasKey {
-		duration := time.Now().Sub(*lastExceededTime)
-		if duration > 30*time.Minute {
-			return false
-		}
-		return true
+	if t, ok := c.modelQuotaExceeded[model]; ok {
+		return time.Since(*t) <= 30*time.Minute
 	}
 	return false
 }
 
-func (c *GeminiAppClient) GetUserAgent() string {
-	return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
+func (c *GeminiAppClient) GetUserAgent() string { return geminiAppUserAgent }
 
 // GetRequestMutex returns nil to opt-out of handler-level per-client locking.
 // This matches other clients in the codebase and prevents potential deadlocks
@@ -724,14 +611,9 @@ func (c *GeminiAppClient) setHeaders(req *http.Request, modelName string) {
 	req.Header.Set("User-Agent", geminiAppUserAgent)
 	req.Header.Set("X-Same-Domain", "1")
 
-	var modelHeader string
-	switch modelName {
-	case "gemini-2.5-flash", "gemini-2.5-flash-lite":
+	modelHeader := geminiAppModelPro
+	if modelName == "gemini-2.5-flash" || modelName == "gemini-2.5-flash-lite" {
 		modelHeader = geminiAppModelFlash
-	case "gemini-2.5-pro":
-		modelHeader = geminiAppModelPro
-	default:
-		modelHeader = geminiAppModelPro
 	}
 	req.Header.Set("x-goog-ext-525001261-jspb", modelHeader)
 }
@@ -845,8 +727,38 @@ func (c *GeminiAppClient) uploadFile(filePath string) (*UploadedFile, error) {
 	}, nil
 }
 
+// uploadInlineFiles writes inline file bytes to temporary files, uploads them, and returns identifiers.
+func (c *GeminiAppClient) uploadInlineFiles(files [][]byte, mimes []string) ([]*UploadedFile, *interfaces.ErrorMessage) {
+	if len(files) == 0 {
+		return nil, nil
+	}
+	uploaded := make([]*UploadedFile, 0, len(files))
+	for i, data := range files {
+		ext := mimeToExt(mimes, i)
+		f, err := os.CreateTemp("", "gemini-upload-*"+ext)
+		if err != nil {
+			return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to create temp file: %w", err)}
+		}
+		if _, err = f.Write(data); err != nil {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+			return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to write temp file: %w", err)}
+		}
+		if err = f.Close(); err != nil {
+			_ = os.Remove(f.Name())
+			return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to close temp file: %w", err)}
+		}
+		up, err := c.uploadFile(f.Name())
+		_ = os.Remove(f.Name())
+		if err != nil {
+			return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to upload file: %w", err)}
+		}
+		uploaded = append(uploaded, up)
+	}
+	return uploaded, nil
+}
+
 func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt, gemID string, files ...*UploadedFile) (*ModelOutput, error) {
-	// This is a simplified version of the python client's request construction
 	var innerPayload []interface{}
 	if len(files) > 0 {
 		var fileList []interface{}
@@ -996,13 +908,6 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 }
 
 // Helper functions for minimal nested slice traversal (error code extraction)
-func safeGet(data []interface{}, index int) (interface{}, error) {
-	if len(data) <= index {
-		return nil, fmt.Errorf("index %d out of bounds for slice of length %d", index, len(data))
-	}
-	return data[index], nil
-}
-
 func safeGetFloat(data [][][]interface{}, indices ...int) (float64, error) {
 	var current interface{} = data
 	for i, index := range indices {
@@ -1074,15 +979,6 @@ func (c *GeminiAppClient) convertOutputToGemini(output *ModelOutput, modelName s
 		return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to marshal gemini response: %w", err)}
 	}
 	return b, nil
-}
-
-func jsonEscape(i string) string {
-	b, err := json.Marshal(i)
-	if err != nil {
-		panic(err)
-	}
-	s := string(b)
-	return s[1 : len(s)-1]
 }
 
 // Dummy structs to represent the output from the gemini-app logic
