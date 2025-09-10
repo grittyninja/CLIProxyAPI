@@ -1,11 +1,11 @@
 ﻿package client
 
 import (
-    "bytes"
-    "context"
-    "errors"
-    "encoding/base64"
+	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -16,48 +16,48 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-    "sync"
-    "time"
+	"sync"
+	"time"
 
-    "github.com/gin-gonic/gin"
-    "github.com/luispater/CLIProxyAPI/internal/auth/gemini"
-    "github.com/luispater/CLIProxyAPI/internal/config"
-    . "github.com/luispater/CLIProxyAPI/internal/constant"
-    "github.com/luispater/CLIProxyAPI/internal/interfaces"
-    "github.com/luispater/CLIProxyAPI/internal/registry"
-    "github.com/luispater/CLIProxyAPI/internal/util"
-    "github.com/luispater/CLIProxyAPI/internal/translator/translator"
-    log "github.com/sirupsen/logrus"
-    "github.com/tidwall/gjson"
+	"github.com/gin-gonic/gin"
+	"github.com/luispater/CLIProxyAPI/internal/auth/gemini"
+	"github.com/luispater/CLIProxyAPI/internal/config"
+	. "github.com/luispater/CLIProxyAPI/internal/constant"
+	"github.com/luispater/CLIProxyAPI/internal/interfaces"
+	"github.com/luispater/CLIProxyAPI/internal/registry"
+	"github.com/luispater/CLIProxyAPI/internal/translator/translator"
+	"github.com/luispater/CLIProxyAPI/internal/util"
+	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 const (
-    geminiAppBaseURL    = "https://gemini.google.com"
-    geminiAppGenerate   = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
-    geminiAppUpload     = "https://content-push.googleapis.com/upload"
-    geminiAppRotate     = "https://accounts.google.com/RotateCookies"
-    geminiAppInit       = "https://gemini.google.com/app"
-    geminiAppUserAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    geminiAppPushID     = "feeds/mcudyrk2a4khkz"
-    geminiAppModelFlash = `[1,null,null,null,"71c2d248d3b102ff",null,null,0,[4]]`
-    geminiAppModelPro   = `[1,null,null,null,"4af6c7f5da75d65d",null,null,0,[4]]`
+	geminiAppBaseURL    = "https://gemini.google.com"
+	geminiAppGenerate   = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
+	geminiAppUpload     = "https://content-push.googleapis.com/upload"
+	geminiAppRotate     = "https://accounts.google.com/RotateCookies"
+	geminiAppInit       = "https://gemini.google.com/app"
+	geminiAppUserAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	geminiAppPushID     = "feeds/mcudyrk2a4khkz"
+	geminiAppModelFlash = `[1,null,null,null,"71c2d248d3b102ff",null,null,0,[4]]`
+	geminiAppModelPro   = `[1,null,null,null,"4af6c7f5da75d65d",null,null,0,[4]]`
 )
 
 // Minimal error codes mapping (from Gemini web responses)
 const (
-    errUsageLimitExceeded   = 1037
-    errModelInconsistent    = 1050
-    errModelHeaderInvalid   = 1052
-    errIPTemporarilyBlocked = 1060
+	errUsageLimitExceeded   = 1037
+	errModelInconsistent    = 1050
+	errModelHeaderInvalid   = 1052
+	errIPTemporarilyBlocked = 1060
 )
 
 // Typed errors for mapping to HTTP status codes
 var (
-    errGeminiUsageLimitExceeded = errors.New("usage limit exceeded")
-    errGeminiModelInconsistent  = errors.New("model inconsistent")
-    errGeminiModelInvalid       = errors.New("model invalid")
-    errGeminiTemporarilyBlocked = errors.New("temporarily blocked")
-    errGeminiAPI                = errors.New("API error")
+	errGeminiUsageLimitExceeded = errors.New("usage limit exceeded")
+	errGeminiModelInconsistent  = errors.New("model inconsistent")
+	errGeminiModelInvalid       = errors.New("model invalid")
+	errGeminiTemporarilyBlocked = errors.New("temporarily blocked")
+	errGeminiAPI                = errors.New("API error")
 )
 
 type GeminiAppClient struct {
@@ -78,17 +78,15 @@ func NewGeminiAppClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, to
 	}
 	jar.SetCookies(cookieURL, cookies)
 
-	log.Debugf("Cookie Jar Content: %+v", jar.Cookies(cookieURL))
+	// Build HTTP client with shared proxy handling (supports socks5/http/https)
+	httpClient := util.SetProxy(cfg, &http.Client{Jar: jar})
 
-    // Build HTTP client with shared proxy handling (supports socks5/http/https)
-    httpClient := util.SetProxy(cfg, &http.Client{Jar: jar})
-
-    // Guard substring length for clientID generation
-    idPrefix := ts.Secure1PSID
-    if len(idPrefix) > 8 {
-        idPrefix = idPrefix[:8]
-    }
-    clientID := fmt.Sprintf("gemini-app-%s-%d", idPrefix, time.Now().UnixNano())
+	// Guard substring length for clientID generation
+	idPrefix := ts.Secure1PSID
+	if len(idPrefix) > 8 {
+		idPrefix = idPrefix[:8]
+	}
+	clientID := fmt.Sprintf("gemini-app-%s-%d", idPrefix, time.Now().UnixNano())
 	client := &GeminiAppClient{
 		ClientBase: ClientBase{
 			RequestMutex:       &sync.Mutex{},
@@ -137,241 +135,241 @@ func (c *GeminiAppClient) GetEmail() string {
 }
 
 func (c *GeminiAppClient) SendRawMessage(ctx context.Context, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
-    // Keep a pristine copy for translator context
-    originalRequestRawJSON := bytes.Clone(rawJSON)
+	// Keep a pristine copy for translator context
+	originalRequestRawJSON := bytes.Clone(rawJSON)
 
-    // Normalize request into Gemini-style JSON if coming from another handler
-    var handlerType string
-    if handler, ok := ctx.Value("handler").(interfaces.APIHandler); ok {
-        handlerType = handler.HandlerType()
-        rawJSON = translator.Request(handlerType, c.Type(), modelName, rawJSON, false)
-    }
+	// Normalize request into Gemini-style JSON if coming from another handler
+	var handlerType string
+	if handler, ok := ctx.Value("handler").(interfaces.APIHandler); ok {
+		handlerType = handler.HandlerType()
+		rawJSON = translator.Request(handlerType, c.Type(), modelName, rawJSON, false)
+	}
 
-    // Log upstream API request body for request logger
-    if c.cfg.RequestLog {
-        if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
-            ginContext.Set("API_REQUEST", rawJSON)
-        }
-    }
+	// Log upstream API request body for request logger
+	if c.cfg.RequestLog {
+		if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
+			ginContext.Set("API_REQUEST", rawJSON)
+		}
+	}
 
-    // Parse prompt and inline files
-    prompt, files, mimes, err := c.extractRequestData(rawJSON)
-    if err != nil {
-        return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
-    }
+	// Parse prompt and inline files
+	prompt, files, mimes, err := c.extractRequestData(rawJSON)
+	if err != nil {
+		return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
+	}
 
-    // Upload inline files to Google
-    var uploadedFiles []*UploadedFile
-    for i, fileData := range files {
-        ext := mimeToExt(mimes, i)
-        tmpfile, errTmp := os.CreateTemp("", "gemini-upload-*"+ext)
-        if errTmp != nil {
-            return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to create temp file: %w", errTmp)}
-        }
-        // Ensure cleanup
-        defer os.Remove(tmpfile.Name())
-        if _, errWrite := tmpfile.Write(fileData); errWrite != nil {
-            return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to write to temp file: %w", errWrite)}
-        }
-        if errClose := tmpfile.Close(); errClose != nil {
-            return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to close temp file: %w", errClose)}
-        }
-        uploadedFile, errUp := c.uploadFile(tmpfile.Name())
-        if errUp != nil {
-            return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to upload file: %w", errUp)}
-        }
-        uploadedFiles = append(uploadedFiles, uploadedFile)
-    }
+	// Upload inline files to Google
+	var uploadedFiles []*UploadedFile
+	for i, fileData := range files {
+		ext := mimeToExt(mimes, i)
+		tmpfile, errTmp := os.CreateTemp("", "gemini-upload-*"+ext)
+		if errTmp != nil {
+			return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to create temp file: %w", errTmp)}
+		}
+		// Ensure cleanup
+		defer os.Remove(tmpfile.Name())
+		if _, errWrite := tmpfile.Write(fileData); errWrite != nil {
+			return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to write to temp file: %w", errWrite)}
+		}
+		if errClose := tmpfile.Close(); errClose != nil {
+			return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to close temp file: %w", errClose)}
+		}
+		uploadedFile, errUp := c.uploadFile(tmpfile.Name())
+		if errUp != nil {
+			return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to upload file: %w", errUp)}
+		}
+		uploadedFiles = append(uploadedFiles, uploadedFile)
+	}
 
-    // Perform generation via the web API
-    output, genErr := c.generateContent(ctx, modelName, prompt, "", uploadedFiles...)
-    if genErr != nil {
-        log.Errorf("failed to generate content: %v", genErr)
-        status := 500
-        switch {
-        case errors.Is(genErr, errGeminiUsageLimitExceeded), errors.Is(genErr, errGeminiTemporarilyBlocked):
-            status = 429
-        case errors.Is(genErr, errGeminiModelInconsistent), errors.Is(genErr, errGeminiModelInvalid):
-            status = 400
-        }
-        if status == 429 {
-            now := time.Now()
-            c.modelQuotaExceeded[modelName] = &now
-            c.SetModelQuotaExceeded(modelName)
-        }
-        return nil, &interfaces.ErrorMessage{StatusCode: status, Error: genErr}
-    }
+	// Perform generation via the web API
+	output, genErr := c.generateContent(ctx, modelName, prompt, "", uploadedFiles...)
+	if genErr != nil {
+		log.Errorf("failed to generate content: %v", genErr)
+		status := 500
+		switch {
+		case errors.Is(genErr, errGeminiUsageLimitExceeded), errors.Is(genErr, errGeminiTemporarilyBlocked):
+			status = 429
+		case errors.Is(genErr, errGeminiModelInconsistent), errors.Is(genErr, errGeminiModelInvalid):
+			status = 400
+		}
+		if status == 429 {
+			now := time.Now()
+			c.modelQuotaExceeded[modelName] = &now
+			c.SetModelQuotaExceeded(modelName)
+		}
+		return nil, &interfaces.ErrorMessage{StatusCode: status, Error: genErr}
+	}
 
-    // Clear quota status on success
-    delete(c.modelQuotaExceeded, modelName)
-    c.ClearModelQuotaExceeded(modelName)
+	// Clear quota status on success
+	delete(c.modelQuotaExceeded, modelName)
+	c.ClearModelQuotaExceeded(modelName)
 
-    // Convert to Gemini API-style JSON, then translate if needed for handler
-    gemBytes, errMsg := c.convertOutputToGemini(output, modelName)
-    if errMsg != nil {
-        return nil, errMsg
-    }
+	// Convert to Gemini API-style JSON, then translate if needed for handler
+	gemBytes, errMsg := c.convertOutputToGemini(output, modelName)
+	if errMsg != nil {
+		return nil, errMsg
+	}
 
-    // Log the constructed upstream-like response for request logger
-    c.AddAPIResponseData(ctx, gemBytes)
+	// Log the constructed upstream-like response for request logger
+	c.AddAPIResponseData(ctx, gemBytes)
 
-    if translator.NeedConvert(handlerType, c.Type()) {
-        var param any
-        out := translator.ResponseNonStream(handlerType, c.Type(), ctx, modelName, originalRequestRawJSON, rawJSON, gemBytes, &param)
-        return []byte(out), nil
-    }
-    return gemBytes, nil
+	if translator.NeedConvert(handlerType, c.Type()) {
+		var param any
+		out := translator.ResponseNonStream(handlerType, c.Type(), ctx, modelName, originalRequestRawJSON, rawJSON, gemBytes, &param)
+		return []byte(out), nil
+	}
+	return gemBytes, nil
 }
 
 func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName string, rawJSON []byte, alt string) (<-chan []byte, <-chan *interfaces.ErrorMessage) {
-    dataChan := make(chan []byte)
-    errChan := make(chan *interfaces.ErrorMessage)
+	dataChan := make(chan []byte)
+	errChan := make(chan *interfaces.ErrorMessage)
 
-    go func() {
-        defer close(dataChan)
-        defer close(errChan)
+	go func() {
+		defer close(dataChan)
+		defer close(errChan)
 
-        // Keep a pristine copy for translator context
-        originalRequestRawJSON := bytes.Clone(rawJSON)
+		// Keep a pristine copy for translator context
+		originalRequestRawJSON := bytes.Clone(rawJSON)
 
-        // Normalize request into Gemini-style JSON if coming from another handler
-        var handlerType string
-        if handler, ok := ctx.Value("handler").(interfaces.APIHandler); ok {
-            handlerType = handler.HandlerType()
-            rawJSON = translator.Request(handlerType, c.Type(), modelName, rawJSON, true)
-        }
+		// Normalize request into Gemini-style JSON if coming from another handler
+		var handlerType string
+		if handler, ok := ctx.Value("handler").(interfaces.APIHandler); ok {
+			handlerType = handler.HandlerType()
+			rawJSON = translator.Request(handlerType, c.Type(), modelName, rawJSON, true)
+		}
 
-        // Log upstream API request body for request logger
-        if c.cfg.RequestLog {
-            if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
-                ginContext.Set("API_REQUEST", rawJSON)
-            }
-        }
+		// Log upstream API request body for request logger
+		if c.cfg.RequestLog {
+			if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
+				ginContext.Set("API_REQUEST", rawJSON)
+			}
+		}
 
-        // Build prompt/files and upload inline files if any
-        prompt, files, mimes, err := c.extractRequestData(rawJSON)
-        if err != nil {
-            errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
-            return
-        }
+		// Build prompt/files and upload inline files if any
+		prompt, files, mimes, err := c.extractRequestData(rawJSON)
+		if err != nil {
+			errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
+			return
+		}
 
-        var uploadedFiles []*UploadedFile
-        for i, fileData := range files {
-            ext := mimeToExt(mimes, i)
-            tmpfile, e := os.CreateTemp("", "gemini-upload-*"+ext)
-            if e != nil {
-                errChan <- &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to create temp file: %w", e)}
-                return
-            }
-            _, _ = tmpfile.Write(fileData)
-            _ = tmpfile.Close()
-            uploadedFile, e := c.uploadFile(tmpfile.Name())
-            os.Remove(tmpfile.Name())
-            if e != nil {
-                errChan <- &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to upload file: %w", e)}
-                return
-            }
-            uploadedFiles = append(uploadedFiles, uploadedFile)
-        }
+		var uploadedFiles []*UploadedFile
+		for i, fileData := range files {
+			ext := mimeToExt(mimes, i)
+			tmpfile, e := os.CreateTemp("", "gemini-upload-*"+ext)
+			if e != nil {
+				errChan <- &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to create temp file: %w", e)}
+				return
+			}
+			_, _ = tmpfile.Write(fileData)
+			_ = tmpfile.Close()
+			uploadedFile, e := c.uploadFile(tmpfile.Name())
+			os.Remove(tmpfile.Name())
+			if e != nil {
+				errChan <- &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to upload file: %w", e)}
+				return
+			}
+			uploadedFiles = append(uploadedFiles, uploadedFile)
+		}
 
-        // Call upstream Gemini App
-        output, genErr := c.generateContent(ctx, modelName, prompt, "", uploadedFiles...)
-        if genErr != nil {
-            status := 500
-            switch {
-            case errors.Is(genErr, errGeminiUsageLimitExceeded), errors.Is(genErr, errGeminiTemporarilyBlocked):
-                status = 429
-            case errors.Is(genErr, errGeminiModelInconsistent), errors.Is(genErr, errGeminiModelInvalid):
-                status = 400
-            }
-            if status == 429 {
-                now := time.Now()
-                c.modelQuotaExceeded[modelName] = &now
-                c.SetModelQuotaExceeded(modelName)
-            }
-            errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: genErr}
-            return
-        }
+		// Call upstream Gemini App
+		output, genErr := c.generateContent(ctx, modelName, prompt, "", uploadedFiles...)
+		if genErr != nil {
+			status := 500
+			switch {
+			case errors.Is(genErr, errGeminiUsageLimitExceeded), errors.Is(genErr, errGeminiTemporarilyBlocked):
+				status = 429
+			case errors.Is(genErr, errGeminiModelInconsistent), errors.Is(genErr, errGeminiModelInvalid):
+				status = 400
+			}
+			if status == 429 {
+				now := time.Now()
+				c.modelQuotaExceeded[modelName] = &now
+				c.SetModelQuotaExceeded(modelName)
+			}
+			errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: genErr}
+			return
+		}
 
-        // Clear quota status on success
-        delete(c.modelQuotaExceeded, modelName)
-        c.ClearModelQuotaExceeded(modelName)
+		// Clear quota status on success
+		delete(c.modelQuotaExceeded, modelName)
+		c.ClearModelQuotaExceeded(modelName)
 
-        // Convert to Gemini response JSON first
-        gemBytes, errMsg := c.convertOutputToGemini(output, modelName)
-        if errMsg != nil {
-            errChan <- errMsg
-            return
-        }
+		// Convert to Gemini response JSON first
+		gemBytes, errMsg := c.convertOutputToGemini(output, modelName)
+		if errMsg != nil {
+			errChan <- errMsg
+			return
+		}
 
-        // Log upstream-like response
-        c.AddAPIResponseData(ctx, gemBytes)
+		// Log upstream-like response
+		c.AddAPIResponseData(ctx, gemBytes)
 
-        // If handler expects another format (e.g. OpenAI/Claude/GeminiCLI),
-        // simulate streaming by emitting Gemini-shaped chunks and translating each chunk.
-        if translator.NeedConvert(handlerType, c.Type()) && handlerType != GEMINI {
-            simulateTranslatedStreaming(ctx, dataChan, handlerType, c.Type(), modelName, originalRequestRawJSON, rawJSON, output)
-            return
-        }
-        // Otherwise (Gemini->Gemini passthrough), simulate streaming like docs/gemini-fastapi
-        // by splitting the final text into small chunks and emitting Gemini-shaped JSON.
-        simulateGeminiStreaming(dataChan, modelName, output)
-    }()
+		// If handler expects another format (e.g. OpenAI/Claude/GeminiCLI),
+		// simulate streaming by emitting Gemini-shaped chunks and translating each chunk.
+		if translator.NeedConvert(handlerType, c.Type()) && handlerType != GEMINI {
+			simulateTranslatedStreaming(ctx, dataChan, handlerType, c.Type(), modelName, originalRequestRawJSON, rawJSON, output)
+			return
+		}
+		// Otherwise (Gemini->Gemini passthrough), simulate streaming like docs/gemini-fastapi
+		// by splitting the final text into small chunks and emitting Gemini-shaped JSON.
+		simulateGeminiStreaming(dataChan, modelName, output)
+	}()
 
-    return dataChan, errChan
+	return dataChan, errChan
 }
 
 // mustJSONMarshalString safely marshals a string into JSON string literal
 func mustJSONMarshalString(s string) string {
-    b, err := json.Marshal(s)
-    if err != nil {
-        esc := strings.ReplaceAll(s, "\"", "\\\"")
-        esc = strings.ReplaceAll(esc, "\n", "\\n")
-        return fmt.Sprintf("\"%s\"", esc)
-    }
-    return string(b)
+	b, err := json.Marshal(s)
+	if err != nil {
+		esc := strings.ReplaceAll(s, "\"", "\\\"")
+		esc = strings.ReplaceAll(esc, "\n", "\\n")
+		return fmt.Sprintf("\"%s\"", esc)
+	}
+	return string(b)
 }
 
 func splitReasoningSegments(s string) []string {
-    s = strings.TrimSpace(s)
-    if s == "" {
-        return nil
-    }
-    parts := strings.Split(s, "\n\n")
-    out := make([]string, 0, len(parts))
-    for _, p := range parts {
-        p = strings.TrimSpace(p)
-        if p != "" {
-            out = append(out, p)
-        }
-    }
-    return out
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, "\n\n")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // chunkByRunes splits a string into rune-safe chunks of up to size runes.
 func chunkByRunes(s string, size int) []string {
-    if size <= 0 {
-        return []string{s}
-    }
-    chunks := make([]string, 0, (len(s)/size)+1)
-    var buf strings.Builder
-    count := 0
-    for _, r := range s {
-        buf.WriteRune(r)
-        count++
-        if count >= size {
-            chunks = append(chunks, buf.String())
-            buf.Reset()
-            count = 0
-        }
-    }
-    if buf.Len() > 0 {
-        chunks = append(chunks, buf.String())
-    }
-    if len(chunks) == 0 {
-        return []string{""}
-    }
-    return chunks
+	if size <= 0 {
+		return []string{s}
+	}
+	chunks := make([]string, 0, (len(s)/size)+1)
+	var buf strings.Builder
+	count := 0
+	for _, r := range s {
+		buf.WriteRune(r)
+		count++
+		if count >= size {
+			chunks = append(chunks, buf.String())
+			buf.Reset()
+			count = 0
+		}
+	}
+	if buf.Len() > 0 {
+		chunks = append(chunks, buf.String())
+	}
+	if len(chunks) == 0 {
+		return []string{""}
+	}
+	return chunks
 }
 
 // simulateGeminiStreaming emits SSE-friendly JSON chunks in a Gemini-like shape.
@@ -379,197 +377,211 @@ func chunkByRunes(s string, size int) []string {
 // and include finish information in the final event. Token usage is not available here,
 // so it falls back to zeros.
 func simulateGeminiStreaming(out chan<- []byte, modelName string, output *ModelOutput) {
-    if output == nil || len(output.Candidates) == 0 {
-        // Nothing to stream
-        return
-    }
+	if output == nil || len(output.Candidates) == 0 {
+		// Nothing to stream
+		return
+	}
 
-    // Compose full text: include thoughts first if present (like fastapi extract_output)
-    fullText := ""
-    if t := strings.TrimSpace(output.Candidates[0].Thoughts); t != "" {
-        fullText += "<think>" + t + "</think>\n"
-    }
-    fullText += output.Candidates[0].Text
+	// Compose full text: include thoughts first if present (like fastapi extract_output)
+	fullText := ""
+	if t := strings.TrimSpace(output.Candidates[0].Thoughts); t != "" {
+		fullText += "<think>" + t + "</think>\n"
+	}
+	fullText += output.Candidates[0].Text
 
-    // Use a conservative small chunk size to deliver a smooth stream.
-    // Count by runes to avoid splitting multi-byte characters.
-    const chunkSize = 32
-    chunks := chunkByRunes(fullText, chunkSize)
+	// Use a conservative small chunk size to deliver a smooth stream.
+	// Count by runes to avoid splitting multi-byte characters.
+	const chunkSize = 32
+	chunks := chunkByRunes(fullText, chunkSize)
 
-    // Helper to build a Gemini-shaped response with a single text part
-    buildChunk := func(text string, finish *string, includeUsage bool) []byte {
-        parts := []map[string]any{}
-        if text != "" {
-            parts = append(parts, map[string]any{"text": text})
-        }
-        resp := map[string]any{
-            "candidates": []any{
-                map[string]any{
-                    "content": map[string]any{
-                        "parts": parts,
-                        "role":  "model",
-                    },
-                    "index": 0,
-                },
-            },
-            "createTime":   time.Now().Format(time.RFC3339Nano),
-            "responseId":   fmt.Sprintf("gemini-app-%d", time.Now().UnixNano()),
-            "modelVersion": modelName,
-        }
-        if finish != nil {
-            // Set finishReason on candidate[0]
-            cand := resp["candidates"].([]any)[0].(map[string]any)
-            cand["finishReason"] = *finish
-        }
-        if includeUsage {
-            resp["usageMetadata"] = map[string]any{
-                "promptTokenCount":     0,
-                "candidatesTokenCount": 0,
-                "totalTokenCount":      0,
-            }
-        }
-        b, _ := json.Marshal(resp)
-        return b
-    }
+	// Helper to build a Gemini-shaped response with a single text part
+	buildChunk := func(text string, finish *string, includeUsage bool) []byte {
+		parts := []map[string]any{}
+		if text != "" {
+			parts = append(parts, map[string]any{"text": text})
+		}
+		resp := map[string]any{
+			"candidates": []any{
+				map[string]any{
+					"content": map[string]any{
+						"parts": parts,
+						"role":  "model",
+					},
+					"index": 0,
+				},
+			},
+			"createTime":   time.Now().Format(time.RFC3339Nano),
+			"responseId":   fmt.Sprintf("gemini-app-%d", time.Now().UnixNano()),
+			"modelVersion": modelName,
+		}
+		if finish != nil {
+			// Set finishReason on candidate[0]
+			cand := resp["candidates"].([]any)[0].(map[string]any)
+			cand["finishReason"] = *finish
+		}
+		if includeUsage {
+			resp["usageMetadata"] = map[string]any{
+				"promptTokenCount":     0,
+				"candidatesTokenCount": 0,
+				"totalTokenCount":      0,
+			}
+		}
+		b, _ := json.Marshal(resp)
+		return b
+	}
 
-    // Send an initial role event (empty delta) to align with some client expectations
-    out <- buildChunk("", nil, false)
+	// Send an initial role event (empty delta) to align with some client expectations
+	out <- buildChunk("", nil, false)
 
-    // Stream content chunks
-    for i := 0; i < len(chunks); i++ {
-        last := i == len(chunks)-1
-        if last {
-            // Final chunk: no text delta (to avoid duplicate text in some clients),
-            // send finish + usage. Then send a closing empty event to clearly delimit end.
-            finish := "STOP"
-            out <- buildChunk("", &finish, true)
-        } else {
-            out <- buildChunk(chunks[i], nil, false)
-        }
-    }
+	// Stream content chunks
+	emittedRunes := 0
+	for i := 0; i < len(chunks); i++ {
+		last := i == len(chunks)-1
+		if last {
+			// Emit the last text chunk first, then emit a finish event.
+			out <- buildChunk(chunks[i], nil, false)
+			emittedRunes += len([]rune(chunks[i]))
+
+			finish := "STOP"
+			out <- buildChunk("", &finish, true)
+		} else {
+			out <- buildChunk(chunks[i], nil, false)
+			emittedRunes += len([]rune(chunks[i]))
+		}
+	}
 }
 
 // simulateTranslatedStreaming splits the final output into Gemini-shaped chunks,
 // translates each chunk into the target handler format (e.g., OpenAI Chat Completions),
 // and pushes them to dataChan one by one.
 func simulateTranslatedStreaming(
-    ctx context.Context,
-    dataChan chan<- []byte,
-    handlerType string,
-    providerType string,
-    modelName string,
-    originalRequestRawJSON []byte,
-    requestRawJSON []byte,
-    output *ModelOutput,
+	ctx context.Context,
+	dataChan chan<- []byte,
+	handlerType string,
+	providerType string,
+	modelName string,
+	originalRequestRawJSON []byte,
+	requestRawJSON []byte,
+	output *ModelOutput,
 ) {
-    if output == nil || len(output.Candidates) == 0 {
-        return
-    }
+	if output == nil || len(output.Candidates) == 0 {
+		return
+	}
 
-    // Prepare full text similar to simulateGeminiStreaming
-    fullText := ""
-    if t := strings.TrimSpace(output.Candidates[0].Thoughts); t != "" {
-        fullText += "<think>" + t + "</think>\n"
-    }
-    fullText += output.Candidates[0].Text
+	// Prepare full text similar to simulateGeminiStreaming
+	fullText := ""
+	if t := strings.TrimSpace(output.Candidates[0].Thoughts); t != "" {
+		fullText += "<think>" + t + "</think>\n"
+	}
+	fullText += output.Candidates[0].Text
 
-    const chunkSize = 32
-    chunks := chunkByRunes(fullText, chunkSize)
+	const chunkSize = 32
+	chunks := chunkByRunes(fullText, chunkSize)
 
-    // Helper to build a Gemini-shaped response chunk
-    buildChunk := func(text string, finish *string, includeUsage bool) []byte {
-        parts := []map[string]any{}
-        if text != "" {
-            parts = append(parts, map[string]any{"text": text})
-        }
-        resp := map[string]any{
-            "candidates": []any{
-                map[string]any{
-                    "content": map[string]any{
-                        "parts": parts,
-                        "role":  "model",
-                    },
-                    "index": 0,
-                },
-            },
-            "createTime":   time.Now().Format(time.RFC3339Nano),
-            "responseId":   fmt.Sprintf("gemini-app-%d", time.Now().UnixNano()),
-            "modelVersion": modelName,
-        }
-        if finish != nil {
-            cand := resp["candidates"].([]any)[0].(map[string]any)
-            cand["finishReason"] = *finish
-        }
-        if includeUsage {
-            resp["usageMetadata"] = map[string]any{
-                "promptTokenCount":     0,
-                "candidatesTokenCount": 0,
-                "totalTokenCount":      0,
-            }
-        }
-        b, _ := json.Marshal(resp)
-        return b
-    }
+	// Helper to build a Gemini-shaped response chunk
+	buildChunk := func(text string, finish *string, includeUsage bool) []byte {
+		parts := []map[string]any{}
+		if text != "" {
+			parts = append(parts, map[string]any{"text": text})
+		}
+		resp := map[string]any{
+			"candidates": []any{
+				map[string]any{
+					"content": map[string]any{
+						"parts": parts,
+						"role":  "model",
+					},
+					"index": 0,
+				},
+			},
+			"createTime":   time.Now().Format(time.RFC3339Nano),
+			"responseId":   fmt.Sprintf("gemini-app-%d", time.Now().UnixNano()),
+			"modelVersion": modelName,
+		}
+		if finish != nil {
+			cand := resp["candidates"].([]any)[0].(map[string]any)
+			cand["finishReason"] = *finish
+		}
+		if includeUsage {
+			resp["usageMetadata"] = map[string]any{
+				"promptTokenCount":     0,
+				"candidatesTokenCount": 0,
+				"totalTokenCount":      0,
+			}
+		}
+		b, _ := json.Marshal(resp)
+		return b
+	}
 
-    var param any
-    // Optionally send an initial empty chunk to establish role in some translators
-    initLines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk("", nil, false), &param)
-    for _, l := range initLines {
-        if l != "" {
-            dataChan <- []byte(l)
-        }
-    }
+	var param any
+	// Optionally send an initial empty chunk to establish role in some translators
+	initLines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk("", nil, false), &param)
+	for _, l := range initLines {
+		if l != "" {
+			dataChan <- []byte(l)
+		}
+	}
 
-    // Stream content chunks
-    for i := 0; i < len(chunks); i++ {
-        last := i == len(chunks)-1
-        if last {
-            // Send final chunk with finish and usage (no delta text to avoid duplication)
-            finish := "stop"
-            endLines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk("", &finish, true), &param)
-            for _, l := range endLines {
-                if l != "" {
-                    dataChan <- []byte(l)
-                }
-            }
-        } else {
-            lines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk(chunks[i], nil, false), &param)
-            for _, l := range lines {
-                if l != "" {
-                    dataChan <- []byte(l)
-                }
-            }
-        }
-    }
+	// Stream content chunks
+	emittedRunes := 0
+	for i := 0; i < len(chunks); i++ {
+		last := i == len(chunks)-1
+		if last {
+			// Emit the last text chunk, then emit a translated finish event.
+			lines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk(chunks[i], nil, false), &param)
+			for _, l := range lines {
+				if l != "" {
+					dataChan <- []byte(l)
+				}
+			}
+			emittedRunes += len([]rune(chunks[i]))
+
+			finish := "stop"
+			endLines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk("", &finish, true), &param)
+			for _, l := range endLines {
+				if l != "" {
+					dataChan <- []byte(l)
+				}
+			}
+		} else {
+			lines := translator.Response(handlerType, providerType, ctx, modelName, originalRequestRawJSON, requestRawJSON, buildChunk(chunks[i], nil, false), &param)
+			for _, l := range lines {
+				if l != "" {
+					dataChan <- []byte(l)
+				}
+			}
+			emittedRunes += len([]rune(chunks[i]))
+		}
+	}
 }
 
 // mimeToExt maps common MIME types to file extensions.
 // Falls back to .png which works for most simple images.
 func mimeToExt(mimes []string, i int) string {
-    if i < len(mimes) {
-        switch strings.ToLower(mimes[i]) {
-        case "image/png":
-            return ".png"
-        case "image/jpeg", "image/jpg":
-            return ".jpg"
-        case "image/webp":
-            return ".webp"
-        case "image/gif":
-            return ".gif"
-        case "image/bmp":
-            return ".bmp"
-        case "image/heic":
-            return ".heic"
-        case "application/pdf":
-            return ".pdf"
-        }
-    }
-    return ".png"
+	if i < len(mimes) {
+		switch strings.ToLower(mimes[i]) {
+		case "image/png":
+			return ".png"
+		case "image/jpeg", "image/jpg":
+			return ".jpg"
+		case "image/webp":
+			return ".webp"
+		case "image/gif":
+			return ".gif"
+		case "image/bmp":
+			return ".bmp"
+		case "image/heic":
+			return ".heic"
+		case "application/pdf":
+			return ".pdf"
+		}
+	}
+	return ".png"
 }
 
 func (c *GeminiAppClient) SendRawTokenCount(ctx context.Context, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
-    // No web endpoint for token counting; return a minimal Gemini-like usage structure
-    return []byte(`{"totalTokens":0}`), nil
+	// No web endpoint for token counting; return a minimal Gemini-like usage structure
+	return []byte(`{"totalTokens":0}`), nil
 }
 
 func (c *GeminiAppClient) SaveTokenToFile() error {
@@ -590,18 +602,18 @@ func (c *GeminiAppClient) IsModelQuotaExceeded(model string) bool {
 }
 
 func (c *GeminiAppClient) GetUserAgent() string {
-    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
 // GetRequestMutex returns nil to opt-out of handler-level per-client locking.
 // This matches other clients in the codebase and prevents potential deadlocks
 // if a long-lived stream holds the lock beyond expected scopes.
 func (c *GeminiAppClient) GetRequestMutex() *sync.Mutex {
-    return nil
+	return nil
 }
 
 func (c *GeminiAppClient) RefreshTokens(ctx context.Context) error {
-    return c.refreshAccessToken()
+	return c.refreshAccessToken()
 }
 
 func (c *GeminiAppClient) rotateCookies() error {
@@ -715,9 +727,9 @@ func (c *GeminiAppClient) setHeaders(req *http.Request, modelName string) {
 }
 
 func (c *GeminiAppClient) extractRequestData(rawJSON []byte) (string, [][]byte, []string, error) {
-    var prompt strings.Builder
-    var files [][]byte
-    var mimes []string
+	var prompt strings.Builder
+	var files [][]byte
+	var mimes []string
 
 	contents := gjson.GetBytes(rawJSON, "contents")
 	if contents.Exists() {
@@ -727,22 +739,22 @@ func (c *GeminiAppClient) extractRequestData(rawJSON []byte) (string, [][]byte, 
 					prompt.WriteString(text.String())
 					prompt.WriteString("\n")
 				}
-                if inlineData := part.Get("inlineData"); inlineData.Exists() {
-                    data := inlineData.Get("data").String()
-                    b, err := base64.StdEncoding.DecodeString(data)
-                    if err == nil {
-                        files = append(files, b)
-                        m := inlineData.Get("mime_type").String()
-                        mimes = append(mimes, m)
-                    }
-                }
+				if inlineData := part.Get("inlineData"); inlineData.Exists() {
+					data := inlineData.Get("data").String()
+					b, err := base64.StdEncoding.DecodeString(data)
+					if err == nil {
+						files = append(files, b)
+						m := inlineData.Get("mime_type").String()
+						mimes = append(mimes, m)
+					}
+				}
 				return true
 			})
 			return true
 		})
 	}
 
-    return strings.TrimSpace(prompt.String()), files, mimes, nil
+	return strings.TrimSpace(prompt.String()), files, mimes, nil
 }
 
 func (c *GeminiAppClient) uploadFile(filePath string) (*UploadedFile, error) {
@@ -765,45 +777,45 @@ func (c *GeminiAppClient) uploadFile(filePath string) (*UploadedFile, error) {
 		return nil, fmt.Errorf("failed to close multipart writer: %w", err)
 	}
 
-    req, err := http.NewRequest("POST", geminiAppUpload, &requestBody)
-    if err != nil {
-        return nil, fmt.Errorf("failed to create upload request: %w", err)
-    }
+	req, err := http.NewRequest("POST", geminiAppUpload, &requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create upload request: %w", err)
+	}
 
-    req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
-    req.Header.Set("Push-ID", geminiAppPushID)
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+	req.Header.Set("Push-ID", geminiAppPushID)
 
-    req.GetBody = func() (io.ReadCloser, error) {
-        return io.NopCloser(bytes.NewReader(requestBody.Bytes())), nil
-    }
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(requestBody.Bytes())), nil
+	}
 
-    // Use a local client to preserve POST + body across redirects; inherit proxy transport
-    localClient := &http.Client{
-        Transport: c.httpClient.Transport,
-        CheckRedirect: func(r *http.Request, via []*http.Request) error {
-            if len(via) > 0 {
-                r.Method = via[0].Method
-                r.Header = via[0].Header.Clone()
-                if via[0].GetBody != nil {
-                    if body, err := via[0].GetBody(); err == nil {
-                        r.Body = body
-                    } else {
-                        r.Body = io.NopCloser(bytes.NewReader(requestBody.Bytes()))
-                    }
-                } else {
-                    r.Body = io.NopCloser(bytes.NewReader(requestBody.Bytes()))
-                }
-            }
-            return nil
-        },
-        Jar:       c.httpClient.Jar,
-        Timeout:   c.httpClient.Timeout,
-    }
+	// Use a local client to preserve POST + body across redirects; inherit proxy transport
+	localClient := &http.Client{
+		Transport: c.httpClient.Transport,
+		CheckRedirect: func(r *http.Request, via []*http.Request) error {
+			if len(via) > 0 {
+				r.Method = via[0].Method
+				r.Header = via[0].Header.Clone()
+				if via[0].GetBody != nil {
+					if body, err := via[0].GetBody(); err == nil {
+						r.Body = body
+					} else {
+						r.Body = io.NopCloser(bytes.NewReader(requestBody.Bytes()))
+					}
+				} else {
+					r.Body = io.NopCloser(bytes.NewReader(requestBody.Bytes()))
+				}
+			}
+			return nil
+		},
+		Jar:     c.httpClient.Jar,
+		Timeout: c.httpClient.Timeout,
+	}
 
-    resp, err := localClient.Do(req)
-    if err != nil {
-        return nil, fmt.Errorf("failed to execute upload request: %w", err)
-    }
+	resp, err := localClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute upload request: %w", err)
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -873,19 +885,19 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 	}
 	defer resp.Body.Close()
 
-    if resp.StatusCode != http.StatusOK {
-        body, _ := io.ReadAll(resp.Body)
-        // Log upstream API response even on error
-        c.AddAPIResponseData(ctx, body)
-        return nil, fmt.Errorf("API request failed with status code %d: %s", resp.StatusCode, string(body))
-    }
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		// Log upstream API response even on error
+		c.AddAPIResponseData(ctx, body)
+		return nil, fmt.Errorf("API request failed with status code %d: %s", resp.StatusCode, string(body))
+	}
 
-    body, err := io.ReadAll(resp.Body)
-    if err != nil {
-        return nil, err
-    }
-    // Log upstream API response body for request logger
-    c.AddAPIResponseData(ctx, body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	// Log upstream API response body for request logger
+	c.AddAPIResponseData(ctx, body)
 
 	lines := strings.Split(string(body), "\n")
 	var responseData [][]interface{}
@@ -900,9 +912,9 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 		return nil, fmt.Errorf("failed to find valid JSON data in response: %s", string(body))
 	}
 
-    var textBuilder strings.Builder
-    var thoughtsBuilder strings.Builder
-    foundAnyText := false
+	var textBuilder strings.Builder
+	var thoughtsBuilder strings.Builder
+	foundAnyText := false
 	for _, part := range responseData {
 		if len(part) < 3 {
 			continue
@@ -920,138 +932,138 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 			candidatesData, _ := mainPart[4].([]interface{})
 			for _, candData := range candidatesData {
 				candList, _ := candData.([]interface{})
-                if len(candList) > 1 {
-                    // Extract thoughts at [37][0][0] if present
-                    if len(candList) > 37 {
-                        if arr1, ok := candList[37].([]interface{}); ok && len(arr1) > 0 {
-                            if arr2, ok2 := arr1[0].([]interface{}); ok2 && len(arr2) > 0 {
-                                if ts, ok3 := arr2[0].(string); ok3 && ts != "" {
-                                    thoughtsBuilder.WriteString(ts)
-                                    if !strings.HasSuffix(ts, "\n\n") {
-                                        thoughtsBuilder.WriteString("\n\n")
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    textSlice, _ := candList[1].([]interface{})
-                    if len(textSlice) > 0 {
-                        text, _ := textSlice[0].(string)
-                        textBuilder.WriteString(text)
-                        if text != "" {
-                            foundAnyText = true
-                        }
-                    }
-                }
-            }
-        }
-    }
+				if len(candList) > 1 {
+					// Extract thoughts at [37][0][0] if present
+					if len(candList) > 37 {
+						if arr1, ok := candList[37].([]interface{}); ok && len(arr1) > 0 {
+							if arr2, ok2 := arr1[0].([]interface{}); ok2 && len(arr2) > 0 {
+								if ts, ok3 := arr2[0].(string); ok3 && ts != "" {
+									thoughtsBuilder.WriteString(ts)
+									if !strings.HasSuffix(ts, "\n\n") {
+										thoughtsBuilder.WriteString("\n\n")
+									}
+								}
+							}
+						}
+					}
+					textSlice, _ := candList[1].([]interface{})
+					if len(textSlice) > 0 {
+						text, _ := textSlice[0].(string)
+						textBuilder.WriteString(text)
+						if text != "" {
+							foundAnyText = true
+						}
+					}
+				}
+			}
+		}
+	}
 
-    // Minimal error code mapping if no candidate text was found
-    if !foundAnyText {
-        if errCode, errGetCode := safeGetFloat([][][]interface{}{responseData}, 0, 5, 2, 0, 1); errGetCode == nil {
-            switch int(errCode) {
-            case errUsageLimitExceeded:
-                return nil, errGeminiUsageLimitExceeded
-            case errModelInconsistent:
-                return nil, errGeminiModelInconsistent
-            case errModelHeaderInvalid:
-                return nil, errGeminiModelInvalid
-            case errIPTemporarilyBlocked:
-                return nil, errGeminiTemporarilyBlocked
-            default:
-                return nil, fmt.Errorf("API error with code: %d", int(errCode))
-            }
-        }
-        return nil, errGeminiAPI
-    }
+	// Minimal error code mapping if no candidate text was found
+	if !foundAnyText {
+		if errCode, errGetCode := safeGetFloat([][][]interface{}{responseData}, 0, 5, 2, 0, 1); errGetCode == nil {
+			switch int(errCode) {
+			case errUsageLimitExceeded:
+				return nil, errGeminiUsageLimitExceeded
+			case errModelInconsistent:
+				return nil, errGeminiModelInconsistent
+			case errModelHeaderInvalid:
+				return nil, errGeminiModelInvalid
+			case errIPTemporarilyBlocked:
+				return nil, errGeminiTemporarilyBlocked
+			default:
+				return nil, fmt.Errorf("API error with code: %d", int(errCode))
+			}
+		}
+		return nil, errGeminiAPI
+	}
 
-    return &ModelOutput{
-        Candidates: []Candidate{
-            {Text: textBuilder.String(), Thoughts: strings.TrimSpace(thoughtsBuilder.String())},
-        },
-        }, nil
+	return &ModelOutput{
+		Candidates: []Candidate{
+			{Text: textBuilder.String(), Thoughts: strings.TrimSpace(thoughtsBuilder.String())},
+		},
+	}, nil
 }
 
 // Helper functions for minimal nested slice traversal (error code extraction)
 func safeGet(data []interface{}, index int) (interface{}, error) {
-    if len(data) <= index {
-        return nil, fmt.Errorf("index %d out of bounds for slice of length %d", index, len(data))
-    }
-    return data[index], nil
+	if len(data) <= index {
+		return nil, fmt.Errorf("index %d out of bounds for slice of length %d", index, len(data))
+	}
+	return data[index], nil
 }
 
 func safeGetFloat(data [][][]interface{}, indices ...int) (float64, error) {
-    var current interface{} = data
-    for i, index := range indices {
-        switch c := current.(type) {
-        case [][][]interface{}:
-            if index >= len(c) {
-                return 0, fmt.Errorf("index %d out of bounds for [][][]interface{}", index)
-            }
-            current = c[index]
-        case [][]interface{}:
-            if index >= len(c) {
-                return 0, fmt.Errorf("index %d out of bounds for [][]interface{}", index)
-            }
-            current = c[index]
-        case []interface{}:
-            if index >= len(c) {
-                return 0, fmt.Errorf("index %d out of bounds for []interface{}", index)
-            }
-            current = c[index]
-        default:
-            return 0, fmt.Errorf("unexpected type at depth %d: %T", i, current)
-        }
-    }
-    f, ok := current.(float64)
-    if !ok {
-        return 0, fmt.Errorf("final value is not a float64, but %T", current)
-    }
-    return f, nil
+	var current interface{} = data
+	for i, index := range indices {
+		switch c := current.(type) {
+		case [][][]interface{}:
+			if index >= len(c) {
+				return 0, fmt.Errorf("index %d out of bounds for [][][]interface{}", index)
+			}
+			current = c[index]
+		case [][]interface{}:
+			if index >= len(c) {
+				return 0, fmt.Errorf("index %d out of bounds for [][]interface{}", index)
+			}
+			current = c[index]
+		case []interface{}:
+			if index >= len(c) {
+				return 0, fmt.Errorf("index %d out of bounds for []interface{}", index)
+			}
+			current = c[index]
+		default:
+			return 0, fmt.Errorf("unexpected type at depth %d: %T", i, current)
+		}
+	}
+	f, ok := current.(float64)
+	if !ok {
+		return 0, fmt.Errorf("final value is not a float64, but %T", current)
+	}
+	return f, nil
 }
 
 // convertOutputToGemini converts our simplified ModelOutput to a Gemini API-like JSON.
 // This enables downstream translators to convert to other formats (e.g., OpenAI) when needed.
 func (c *GeminiAppClient) convertOutputToGemini(output *ModelOutput, modelName string) ([]byte, *interfaces.ErrorMessage) {
-    if output == nil || len(output.Candidates) == 0 {
-        return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("empty output")}
-    }
+	if output == nil || len(output.Candidates) == 0 {
+		return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("empty output")}
+	}
 
-    parts := make([]map[string]any, 0, 2)
-    // Include reasoning/thoughts as a dedicated part if present
-    if t := strings.TrimSpace(output.Candidates[0].Thoughts); t != "" {
-        parts = append(parts, map[string]any{"text": t, "thought": true})
-    }
-    // Main assistant content
-    parts = append(parts, map[string]any{"text": output.Candidates[0].Text})
+	parts := make([]map[string]any, 0, 2)
+	// Include reasoning/thoughts as a dedicated part if present
+	if t := strings.TrimSpace(output.Candidates[0].Thoughts); t != "" {
+		parts = append(parts, map[string]any{"text": t, "thought": true})
+	}
+	// Main assistant content
+	parts = append(parts, map[string]any{"text": output.Candidates[0].Text})
 
-    resp := map[string]any{
-        "candidates": []any{
-            map[string]any{
-                "content": map[string]any{
-                    "parts": parts,
-                    "role":  "model",
-                },
-                "finishReason": "STOP",
-                "index":       0,
-            },
-        },
-        // Provide timestamps and IDs similar to Gemini API fields some translators use
-        "createTime":   time.Now().Format(time.RFC3339Nano),
-        "responseId":   fmt.Sprintf("gemini-app-%d", time.Now().UnixNano()),
-        "modelVersion": modelName,
-        "usageMetadata": map[string]any{
-            "promptTokenCount":     0,
-            "candidatesTokenCount": 0,
-            "totalTokenCount":      0,
-        },
-    }
-    b, err := json.Marshal(resp)
-    if err != nil {
-        return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to marshal gemini response: %w", err)}
-    }
-    return b, nil
+	resp := map[string]any{
+		"candidates": []any{
+			map[string]any{
+				"content": map[string]any{
+					"parts": parts,
+					"role":  "model",
+				},
+				"finishReason": "STOP",
+				"index":        0,
+			},
+		},
+		// Provide timestamps and IDs similar to Gemini API fields some translators use
+		"createTime":   time.Now().Format(time.RFC3339Nano),
+		"responseId":   fmt.Sprintf("gemini-app-%d", time.Now().UnixNano()),
+		"modelVersion": modelName,
+		"usageMetadata": map[string]any{
+			"promptTokenCount":     0,
+			"candidatesTokenCount": 0,
+			"totalTokenCount":      0,
+		},
+	}
+	b, err := json.Marshal(resp)
+	if err != nil {
+		return nil, &interfaces.ErrorMessage{StatusCode: 500, Error: fmt.Errorf("failed to marshal gemini response: %w", err)}
+	}
+	return b, nil
 }
 
 func jsonEscape(i string) string {
@@ -1065,13 +1077,13 @@ func jsonEscape(i string) string {
 
 // Dummy structs to represent the output from the gemini-app logic
 type ModelOutput struct {
-    Candidates []Candidate
-    Metadata   []string
+	Candidates []Candidate
+	Metadata   []string
 }
 
 type Candidate struct {
-    Text     string
-    Thoughts string
+	Text     string
+	Thoughts string
 }
 
 type UploadedFile struct {
