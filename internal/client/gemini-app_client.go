@@ -187,6 +187,7 @@ func (c *GeminiAppClient) SendRawMessage(ctx context.Context, modelName string, 
     }
     prompt := buildPrompt(messages[reuseIdx:], useTags, useTags)
 
+    log.Debugf("Use Gemini App account %s for model %s", c.GetEmail(), modelName)
     // Perform generation via the web API
     output, genErr := c.sendWithSplit(ctx, modelName, prompt, meta, uploadedFiles...)
     if genErr != nil {
@@ -315,6 +316,7 @@ func (c *GeminiAppClient) SendRawMessageStream(ctx context.Context, modelName st
         }
         prompt := buildPrompt(messages[reuseIdx:], useTags, useTags)
 
+        log.Debugf("Use Gemini App account %s for model %s", c.GetEmail(), modelName)
         // Call upstream Gemini App with splitting if needed
         output, genErr := c.sendWithSplit(ctx, modelName, prompt, meta, uploadedFiles...)
         if genErr != nil {
@@ -1073,7 +1075,7 @@ func (c *GeminiAppClient) generateContent(ctx context.Context, modelName, prompt
 
 	c.setHeaders(req, modelName)
 
-	log.Debugf("Use Gemini App account %s for model %s", c.GetEmail(), modelName)
+    // Logging moved to call sites to avoid repeated logs on split/retry
 
     resp, err := c.httpClient.Do(req)
     if err != nil {
