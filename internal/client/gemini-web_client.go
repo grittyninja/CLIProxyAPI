@@ -643,6 +643,7 @@ func (c *GeminiWebClient) registerGeminiWebModels() {
             Description: "Stable version of Gemini 2.5 Flash, our mid-size multimodal model that supports up to 1 million tokens, released in June of 2025.",
             InputTokenLimit: 1048576,
             OutputTokenLimit: 65536,
+            SupportedParameters: []string{"tools", "vision", "thinking"},
         },
         {
             ID:          "gemini-web-2.5-pro",
@@ -655,6 +656,7 @@ func (c *GeminiWebClient) registerGeminiWebModels() {
             Description: "Stable release (June 17th, 2025) of Gemini 2.5 Pro",
             InputTokenLimit: 1048576,
             OutputTokenLimit: 65536,
+            SupportedParameters: []string{"tools", "vision", "thinking"},
         },
     }
     c.RegisterModels(GEMINI, models)
@@ -665,7 +667,7 @@ func mapAliasToUnderlying(name string) string {
     switch strings.ToLower(name) {
     case "gemini-web-2.5-pro":
         return "gemini-2.5-pro"
-    case "gemini-web-2.5-flash", "gemini-web-2.5-flash-lite":
+    case "gemini-web-2.5-flash":
         return "gemini-2.5-flash"
     default:
         // If user passes original names, pass through for compatibility
@@ -675,9 +677,14 @@ func mapAliasToUnderlying(name string) string {
 
 // ---------- Persistence of conversation metadata ----------
 func (c *GeminiWebClient) convStorePath() string {
-    dir := filepath.Dir(c.tokenFilePath)
+    // Store conversations under <program-working-dir>/conv/
+    wd, err := os.Getwd()
+    if err != nil || wd == "" {
+        wd = "."
+    }
+    convDir := filepath.Join(wd, "conv")
     base := strings.TrimSuffix(filepath.Base(c.tokenFilePath), filepath.Ext(c.tokenFilePath))
-    return filepath.Join(dir, base+".conv.json")
+    return filepath.Join(convDir, base+".conv.json")
 }
 
 func (c *GeminiWebClient) loadConvStore() error {
@@ -703,6 +710,8 @@ func (c *GeminiWebClient) saveConvStore() error {
     c.convMutex.RUnlock()
     if err != nil { return err }
     tmp := path + ".tmp"
+    // Ensure target directory exists
+    if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { return err }
     if err := os.WriteFile(tmp, data, 0o644); err != nil { return err }
     return os.Rename(tmp, path)
 }
