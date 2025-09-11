@@ -51,6 +51,20 @@ func StartService(cfg *config.Config, configPath string) {
 	// Create a pool of API clients, one for each token file found.
 	cliClients := make(map[string]interfaces.Client)
 	successfulAuthCount := 0
+	// Ensure the auth directory exists before walking it.
+	if info, statErr := os.Stat(cfg.AuthDir); statErr != nil {
+		if os.IsNotExist(statErr) {
+			if mkErr := os.MkdirAll(cfg.AuthDir, 0755); mkErr != nil {
+				log.Fatalf("failed to create auth directory %s: %v", cfg.AuthDir, mkErr)
+			}
+			log.Infof("created missing auth directory: %s", cfg.AuthDir)
+		} else {
+			log.Fatalf("error checking auth directory %s: %v", cfg.AuthDir, statErr)
+		}
+	} else if !info.IsDir() {
+		log.Fatalf("auth path exists but is not a directory: %s", cfg.AuthDir)
+	}
+
 	err := filepath.Walk(cfg.AuthDir, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
 			return err
