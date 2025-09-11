@@ -73,6 +73,7 @@ type GeminiWebClient struct {
     convMutex sync.RWMutex
 
     cookieRotationStarted bool
+    cookiePersistCancel   context.CancelFunc
 }
 
 func NewGeminiWebClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, tokenFilePath string) (*GeminiWebClient, error) {
@@ -112,6 +113,8 @@ func NewGeminiWebClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, to
         go client.backgroundInitRetry()
     } else {
         client.cookieRotationStarted = true // auto-refresh handled inside gwc
+        // start persistence watcher for rotated cookies
+        client.startCookiePersist()
     }
 
     return client, nil
@@ -122,7 +125,12 @@ func (c *GeminiWebClient) Init() error {
     // Initialize underlying web client (retry logic handled by caller)
     ts := c.tokenStorage.(*gemini.GeminiAppTokenStorage)
     c.gwc = gemweb.NewGeminiClient(ts.Secure1PSID, ts.Secure1PSIDTS, c.cfg.ProxyURL)
-    return c.gwc.Init(300, false, 300, true, 540, false)
+    if err := c.gwc.Init(300, false, 300, true, 540, false); err != nil {
+        return err
+    }
+    // restart cookie persist loop after re-init
+    c.startCookiePersist()
+    return nil
 }
 
 func (c *GeminiWebClient) Type() string {
@@ -727,6 +735,8 @@ func (c *GeminiWebClient) backgroundInitRetry() {
                 c.cookieRotationStarted = true
                 // Auto refresh is handled inside geminiwebapi client
             }
+            // ensure persistence loop is running
+            c.startCookiePersist()
             return
         }
         d := backoffs[i]
@@ -735,6 +745,51 @@ func (c *GeminiWebClient) backgroundInitRetry() {
         }
         time.Sleep(d)
     }
+}
+
+// startCookiePersist starts a lightweight loop that detects cookie rotation
+// from the underlying web client and persists refreshes to the token file.
+func (c *GeminiWebClient) startCookiePersist() {
+    if c.gwc == nil {
+        return
+    }
+    // cancel previous loop if running
+    if c.cookiePersistCancel != nil {
+        c.cookiePersistCancel()
+        c.cookiePersistCancel = nil
+    }
+    ctx, cancel := context.WithCancel(context.Background())
+    c.cookiePersistCancel = cancel
+
+    go func() {
+        ticker := time.NewTicker(60 * time.Second)
+        defer ticker.Stop()
+        last := ""
+        if v, ok := c.gwc.Cookies["__Secure-1PSIDTS"]; ok {
+            last = v
+        }
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            case <-ticker.C:
+                cur := ""
+                if c.gwc != nil && c.gwc.Cookies != nil {
+                    if v, ok := c.gwc.Cookies["__Secure-1PSIDTS"]; ok {
+                        cur = v
+                    }
+                }
+                if cur != "" && cur != last {
+                    if err := c.SaveTokenToFile(); err != nil {
+                        log.Errorf("Failed to persist rotated cookies for %s: %v", c.GetEmail(), err)
+                    } else {
+                        log.Debugf("Persisted rotated cookies for %s", c.GetEmail())
+                        last = cur
+                    }
+                }
+            }
+        }
+    }()
 }
 
 type roleText struct {
