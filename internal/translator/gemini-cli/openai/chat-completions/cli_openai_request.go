@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/luispater/CLIProxyAPI/internal/misc"
+	"github.com/luispater/CLIProxyAPI/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -227,6 +228,16 @@ func ConvertOpenAIRequestToGeminiCLI(modelName string, inputRawJSON []byte, _ bo
 					out, _ = sjson.SetRawBytes(out, fdPath+".-1", []byte(fn.Raw))
 				}
 			}
+		}
+	}
+
+	var pathsToType []string
+	root := gjson.ParseBytes(out)
+	util.Walk(root, "", "type", &pathsToType)
+	for _, p := range pathsToType {
+		typeResult := gjson.GetBytes(out, p)
+		if strings.ToLower(typeResult.String()) == "select" {
+			out, _ = sjson.SetBytes(out, p, "STRING")
 		}
 	}
 

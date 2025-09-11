@@ -46,7 +46,7 @@ type GeminiClient struct {
 //   - *GeminiClient: A new Gemini client instance.
 func NewGeminiClient(httpClient *http.Client, cfg *config.Config, glAPIKey string) *GeminiClient {
 	// Generate unique client ID
-	clientID := fmt.Sprintf("gemini-apikey-%s-%d", glAPIKey[:8], time.Now().UnixNano()) // Use first 8 chars of API key
+	clientID := fmt.Sprintf("gemini-apikey-%s-%d", glAPIKey, time.Now().UnixNano())
 
 	client := &GeminiClient{
 		ClientBase: ClientBase{
