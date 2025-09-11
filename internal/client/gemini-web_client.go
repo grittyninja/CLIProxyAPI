@@ -638,9 +638,11 @@ func (c *GeminiWebClient) registerGeminiWebModels() {
             Created:     time.Now().Unix(),
             OwnedBy:     "google",
             Type:        GEMINI,
-            Name:        "models/gemini-2.5-flash",
+            Name:        "gemini-web-2.5-flash",
             Version:     "2.5",
-            DisplayName: "Gemini Web 2.5 Flash",
+            Description: "Stable version of Gemini 2.5 Flash, our mid-size multimodal model that supports up to 1 million tokens, released in June of 2025.",
+            InputTokenLimit: 1048576,
+            OutputTokenLimit: 65536,
         },
         {
             ID:          "gemini-web-2.5-pro",
@@ -648,9 +650,11 @@ func (c *GeminiWebClient) registerGeminiWebModels() {
             Created:     time.Now().Unix(),
             OwnedBy:     "google",
             Type:        GEMINI,
-            Name:        "models/gemini-2.5-pro",
+            Name:        "gemini-web-2.5-pro",
             Version:     "2.5",
-            DisplayName: "Gemini Web 2.5 Pro",
+            Description: "Stable release (June 17th, 2025) of Gemini 2.5 Pro",
+            InputTokenLimit: 1048576,
+            OutputTokenLimit: 65536,
         },
     }
     c.RegisterModels(GEMINI, models)
