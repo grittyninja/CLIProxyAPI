@@ -7,22 +7,31 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/luispater/CLIProxyAPI/internal/config"
 	"golang.org/x/crypto/bcrypt"
 )
 
+type attemptInfo struct {
+	count        int
+	blockedUntil time.Time
+}
+
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
 	cfg            *config.Config
 	configFilePath string
 	mu             sync.Mutex
+
+	attemptsMu     sync.Mutex
+	failedAttempts map[string]*attemptInfo // keyed by client IP
 }
 
 // NewHandler creates a new management handler instance.
 func NewHandler(cfg *config.Config, configFilePath string) *Handler {
-	return &Handler{cfg: cfg, configFilePath: configFilePath}
+	return &Handler{cfg: cfg, configFilePath: configFilePath, failedAttempts: make(map[string]*attemptInfo)}
 }
 
 // SetConfig updates the in-memory config reference when the server hot-reloads.
@@ -32,11 +41,32 @@ func (h *Handler) SetConfig(cfg *config.Config) { h.cfg = cfg }
 // All requests (local and remote) require a valid management key.
 // Additionally, remote access requires allow-remote-management=true.
 func (h *Handler) Middleware() gin.HandlerFunc {
+	const maxFailures = 5
+	const banDuration = 30 * time.Minute
+
 	return func(c *gin.Context) {
 		clientIP := c.ClientIP()
 
-		// Remote access control: when not loopback, must be enabled
+		// For remote IPs, enforce allow-remote-management and ban checks
 		if !(clientIP == "127.0.0.1" || clientIP == "::1") {
+			// Check if IP is currently blocked
+			h.attemptsMu.Lock()
+			ai := h.failedAttempts[clientIP]
+			if ai != nil {
+				if !ai.blockedUntil.IsZero() {
+					if time.Now().Before(ai.blockedUntil) {
+						remaining := time.Until(ai.blockedUntil).Round(time.Second)
+						h.attemptsMu.Unlock()
+						c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": fmt.Sprintf("IP banned due to too many failed attempts. Try again in %s", remaining)})
+						return
+					}
+					// Ban expired, reset state
+					ai.blockedUntil = time.Time{}
+					ai.count = 0
+				}
+			}
+			h.attemptsMu.Unlock()
+
 			allowRemote := h.cfg.RemoteManagement.AllowRemote
 			if !allowRemote {
 				allowRemote = true
@@ -67,15 +97,41 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		}
 
 		if !(clientIP == "127.0.0.1" || clientIP == "::1") {
+			// For remote IPs, enforce key and track failures
+			fail := func() {
+				h.attemptsMu.Lock()
+				ai := h.failedAttempts[clientIP]
+				if ai == nil {
+					ai = &attemptInfo{}
+					h.failedAttempts[clientIP] = ai
+				}
+				ai.count++
+				if ai.count >= maxFailures {
+					ai.blockedUntil = time.Now().Add(banDuration)
+					ai.count = 0
+				}
+				h.attemptsMu.Unlock()
+			}
+
 			if provided == "" {
+				fail()
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing management key"})
 				return
 			}
 
 			if err := bcrypt.CompareHashAndPassword([]byte(secret), []byte(provided)); err != nil {
+				fail()
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid management key"})
 				return
 			}
+
+			// Success: reset failed count for this IP
+			h.attemptsMu.Lock()
+			if ai := h.failedAttempts[clientIP]; ai != nil {
+				ai.count = 0
+				ai.blockedUntil = time.Time{}
+			}
+			h.attemptsMu.Unlock()
 		}
 
 		c.Next()
