@@ -675,9 +675,10 @@ func mapAliasToUnderlying(name string) string {
 
 // ---------- Persistence of conversation metadata ----------
 func (c *GeminiWebClient) convStorePath() string {
-    dir := filepath.Dir(c.tokenFilePath)
+    // Store conversations under <auth-dir>/conv/
+    convDir := filepath.Join(c.cfg.AuthDir, "conv")
     base := strings.TrimSuffix(filepath.Base(c.tokenFilePath), filepath.Ext(c.tokenFilePath))
-    return filepath.Join(dir, base+".conv.json")
+    return filepath.Join(convDir, base+".conv.json")
 }
 
 func (c *GeminiWebClient) loadConvStore() error {
@@ -703,6 +704,8 @@ func (c *GeminiWebClient) saveConvStore() error {
     c.convMutex.RUnlock()
     if err != nil { return err }
     tmp := path + ".tmp"
+    // Ensure target directory exists
+    if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { return err }
     if err := os.WriteFile(tmp, data, 0o644); err != nil { return err }
     return os.Rename(tmp, path)
 }
