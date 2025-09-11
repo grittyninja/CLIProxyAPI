@@ -335,7 +335,7 @@ func (w *Watcher) createClientFromFile(path string, cfg *config.Config) (interfa
 		return nil, nil // Not an error, just nothing to process yet.
 	}
 
-	tokenType := "gemini"
+	tokenType := ""
 	typeResult := gjson.GetBytes(data, "type")
 	if typeResult.Exists() {
 		tokenType = typeResult.String()

@@ -79,7 +79,7 @@ func StartService(cfg *config.Config, configPath string) {
 			}
 
 			// Determine token type from JSON data, defaulting to "gemini" if not specified.
-			tokenType := "gemini"
+			tokenType := ""
 			typeResult := gjson.GetBytes(data, "type")
 			if typeResult.Exists() {
 				tokenType = typeResult.String()
