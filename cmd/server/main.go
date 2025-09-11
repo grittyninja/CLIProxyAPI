@@ -72,7 +72,7 @@ func main() {
 	var codexLogin bool
 	var claudeLogin bool
 	var qwenLogin bool
-	var geminiAppAuth bool
+    var geminiWebAuth bool
 	var noBrowser bool
 	var projectID string
 	var configPath string
@@ -82,7 +82,7 @@ func main() {
 	flag.BoolVar(&codexLogin, "codex-login", false, "Login to Codex using OAuth")
 	flag.BoolVar(&claudeLogin, "claude-login", false, "Login to Claude using OAuth")
 	flag.BoolVar(&qwenLogin, "qwen-login", false, "Login to Qwen using OAuth")
-	flag.BoolVar(&geminiAppAuth, "gemini-app-auth", false, "Auth Gemini App using cookies")
+    flag.BoolVar(&geminiWebAuth, "gemini-web-auth", false, "Auth Gemini Web using cookies")
 	flag.BoolVar(&noBrowser, "no-browser", false, "Don't open browser automatically for OAuth")
 	flag.StringVar(&projectID, "project_id", "", "Project ID (Gemini only, not required)")
 	flag.StringVar(&configPath, "config", "", "Configure File Path")
@@ -152,9 +152,9 @@ func main() {
 		cmd.DoClaudeLogin(cfg, options)
 	} else if qwenLogin {
 		cmd.DoQwenLogin(cfg, options)
-	} else if geminiAppAuth {
-		cmd.DoGeminiAppAuth(cfg)
-	} else {
+    } else if geminiWebAuth {
+        cmd.DoGeminiWebAuth(cfg)
+    } else {
 		// Start the main proxy service
 		cmd.StartService(cfg, configFilePath)
 	}

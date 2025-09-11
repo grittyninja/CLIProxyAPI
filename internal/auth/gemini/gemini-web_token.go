@@ -21,7 +21,7 @@ type GeminiAppTokenStorage struct {
 
 // SaveTokenToFile serializes the Gemini App token storage to a JSON file.
 func (ts *GeminiAppTokenStorage) SaveTokenToFile(authFilePath string) error {
-	ts.Type = "gemini-app"
+    ts.Type = "gemini-web"
 	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}

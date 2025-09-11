@@ -1,4 +1,4 @@
-// Package cmd provides command-line interface functionality for the CLI Proxy API.
+﻿// Package cmd provides command-line interface functionality for the CLI Proxy API.
 package cmd
 
 import (
@@ -15,9 +15,9 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// DoGeminiAppAuth handles the process of creating a Gemini App token file.
+// DoGeminiWebAuth handles the process of creating a Gemini Web token file.
 // It prompts the user for their cookie values and saves them to a JSON file.
-func DoGeminiAppAuth(cfg *config.Config) {
+func DoGeminiWebAuth(cfg *config.Config) {
 	reader := bufio.NewReader(os.Stdin)
 
 	fmt.Print("Enter your __Secure-1PSID cookie value: ")
@@ -47,14 +47,14 @@ func DoGeminiAppAuth(cfg *config.Config) {
 	hasher := sha256.New()
 	hasher.Write([]byte(secure1psid))
 	hash := hex.EncodeToString(hasher.Sum(nil))
-	fileName := fmt.Sprintf("gemini-app-%s.json", hash[:16])
+    fileName := fmt.Sprintf("gemini-web-%s.json", hash[:16])
 	filePath := filepath.Join(cfg.AuthDir, fileName)
 
 	err := tokenStorage.SaveTokenToFile(filePath)
-	if err != nil {
-		log.Fatalf("Failed to save Gemini App token to file: %v", err)
-		return
-	}
+    if err != nil {
+        log.Fatalf("Failed to save Gemini Web token to file: %v", err)
+        return
+    }
 
-	log.Infof("Successfully saved Gemini App token to: %s", filePath)
+    log.Infof("Successfully saved Gemini Web token to: %s", filePath)
 }
