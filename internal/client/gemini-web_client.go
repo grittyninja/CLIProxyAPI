@@ -62,6 +62,18 @@ var (
 	errGeminiAPI                = errors.New("API error")
 )
 
+// normalizeRole maps provider-specific roles to the internal set we use for
+// conversation tracking. In Gemini API payloads, the assistant role is named
+// "model"; we normalize it to "assistant" to keep keys consistent across
+// storage and lookups.
+func normalizeRole(role string) string {
+    r := strings.ToLower(role)
+    if r == "model" {
+        return "assistant"
+    }
+    return r
+}
+
 type GeminiWebClient struct {
     ClientBase
     // Gemini Web API client
@@ -71,6 +83,10 @@ type GeminiWebClient struct {
     // in-memory conversation store: key -> metadata
     convStore map[string][]string
     convMutex sync.RWMutex
+
+    // in-memory chat session cache: convKey -> active ChatSession
+    chatStore map[string]*gemweb.ChatSession
+    chatMutex sync.RWMutex
 
     cookieRotationStarted bool
     cookiePersistCancel   context.CancelFunc
@@ -109,15 +125,16 @@ func NewGeminiWebClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, to
 	}
     clientID := fmt.Sprintf("gemini-web-%s-%d", idPrefix, time.Now().UnixNano())
     client := &GeminiWebClient{
-		ClientBase: ClientBase{
-			RequestMutex:       &sync.Mutex{},
-			httpClient:         httpClient,
-			cfg:                cfg,
-			tokenStorage:       ts,
-			modelQuotaExceeded: make(map[string]*time.Time),
-		},
+        ClientBase: ClientBase{
+            RequestMutex:       &sync.Mutex{},
+            httpClient:         httpClient,
+            cfg:                cfg,
+            tokenStorage:       ts,
+            modelQuotaExceeded: make(map[string]*time.Time),
+        },
         tokenFilePath: tokenFilePath,
         convStore:     make(map[string][]string),
+        chatStore:     make(map[string]*gemweb.ChatSession),
     }
 
     // Load persisted conversation metadata for multi-turn continuity across restarts
@@ -204,33 +221,92 @@ func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, 
     cleaned := sanitizeAssistantMessages(messages)
     meta, reuseIdx := c.findReusableMetadata(modelName, cleaned)
 
-    // Build prompt from remaining messages (suffix);
-    // if only one new user message and we have metadata, skip role tags.
-    useTags := needRoleTags(messages)
-    if reuseIdx > 0 && len(messages[reuseIdx:]) == 1 && strings.ToLower(messages[reuseIdx].Role) == "user" {
-        useTags = false
+    // Only send the current turn's new user message as prompt
+    useTags := false
+    explicitContext := false
+    var prompt string
+    for i := len(messages) - 1; i >= 0; i-- {
+        if strings.ToLower(messages[i].Role) == "user" {
+            prompt = messages[i].Text
+            break
+        }
     }
-    prompt := buildPrompt(messages[reuseIdx:], useTags, useTags)
+    if prompt == "" {
+        return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: errors.New("bad request: no user message found at the end of conversation")}
+    }
+
+    // For request logging: append upstream prompt/decision details into API_REQUEST
+    if c.cfg.RequestLog {
+        if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
+            var sb strings.Builder
+            sb.WriteString("\n\n--- GEMINI WEB UPSTREAM DEBUG ---\n")
+            sb.WriteString(fmt.Sprintf("account: %s\n", c.GetEmail()))
+            sb.WriteString(fmt.Sprintf("reuseIdx: %d\n", reuseIdx))
+            sb.WriteString(fmt.Sprintf("useTags: %t\n", useTags))
+            sb.WriteString(fmt.Sprintf("metadata_len: %d\n", len(meta)))
+            if explicitContext { sb.WriteString("explicit_context: true\n") } else { sb.WriteString("explicit_context: false\n") }
+            if l := len(uploadedFiles); l > 0 { sb.WriteString(fmt.Sprintf("files: %d\n", l)) }
+            // Truncate prompt preview to a safe size (rune-aware)
+            chunks := chunkByRunes(prompt, 4096)
+            preview := prompt
+            truncated := false
+            if len(chunks) > 1 {
+                preview = chunks[0]
+                truncated = true
+            }
+            sb.WriteString("prompt_preview:\n")
+            sb.WriteString(preview)
+            if truncated { sb.WriteString("\n... [truncated]\n") }
+
+            if existing, exists := ginContext.Get("API_REQUEST"); exists {
+                if base, ok2 := existing.([]byte); ok2 {
+                    merged := append(append([]byte{}, base...), []byte(sb.String())...)
+                    ginContext.Set("API_REQUEST", merged)
+                }
+            }
+        }
+    }
+
+    // Resolve or initialize chat session for this conversation prefix
+    var chat *gemweb.ChatSession
+    var sessionKey string
+    if reuseIdx > 0 && len(meta) > 0 {
+        prefix := make([]roleText, reuseIdx)
+        copy(prefix, cleaned[:reuseIdx])
+        sessionKey = c.conversationKey(modelName, prefix)
+        c.chatMutex.RLock()
+        chat = c.chatStore[sessionKey]
+        c.chatMutex.RUnlock()
+        if chat == nil {
+            underlying := mapAliasToUnderlying(modelName)
+            model, err := gemweb.ModelFromName(underlying)
+            if err != nil { return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: err} }
+            chat = c.gwc.StartChat(model, nil, meta)
+            c.chatMutex.Lock(); c.chatStore[sessionKey] = chat; c.chatMutex.Unlock()
+        }
+    } else {
+        underlying := mapAliasToUnderlying(modelName)
+        model, err := gemweb.ModelFromName(underlying)
+        if err != nil { return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: err} }
+        chat = c.gwc.StartChat(model, nil, nil)
+    }
 
     log.Debugf("Use Gemini Web account %s for model %s", c.GetEmail(), modelName)
-    // Perform generation via the web API (single request; session handles multi-turn)
-    output, genErr := c.generateWithChat(ctx, modelName, prompt, meta, uploadedFiles...)
-    if genErr != nil {
+    var output *gemweb.ModelOutput
+    if out, genErr := chat.SendMessage(prompt, uploadedFiles); genErr != nil {
         log.Errorf("failed to generate content: %v", genErr)
         status := 500
         switch {
         case errors.Is(genErr, errGeminiUsageLimitExceeded), errors.Is(genErr, errGeminiTemporarilyBlocked):
-			status = 429
-		case errors.Is(genErr, errGeminiModelInconsistent), errors.Is(genErr, errGeminiModelInvalid):
-			status = 400
-		}
-		if status == 429 {
-			now := time.Now()
-			c.modelQuotaExceeded[modelName] = &now
-			c.SetModelQuotaExceeded(modelName)
-		}
-		return nil, &interfaces.ErrorMessage{StatusCode: status, Error: genErr}
-	}
+            status = 429
+        case errors.Is(genErr, errGeminiModelInconsistent), errors.Is(genErr, errGeminiModelInvalid):
+            status = 400
+        }
+        if status == 429 {
+            now := time.Now(); c.modelQuotaExceeded[modelName] = &now; c.SetModelQuotaExceeded(modelName)
+        }
+        return nil, &interfaces.ErrorMessage{StatusCode: status, Error: genErr}
+    } else { output = &out }
 
     // Clear quota status on success
     delete(c.modelQuotaExceeded, modelName)
@@ -245,9 +321,15 @@ func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, 
     // Log the constructed upstream-like response for request logger
     c.AddAPIResponseData(ctx, gemBytes)
 
-    // Store refreshed conversation metadata for future reuse
+    // Store refreshed conversation metadata for future reuse and update chat cache key
     if output != nil && len(output.Metadata) > 0 && len(output.Candidates) > 0 {
         c.storeConversation(modelName, cleaned, output.Candidates[0].Text, output.Metadata)
+        newPrefix := append(append([]roleText{}, cleaned...), roleText{Role: "assistant", Text: removeThinkTags(output.Candidates[0].Text)})
+        newKey := c.conversationKey(modelName, newPrefix)
+        c.chatMutex.Lock()
+        if sessionKey != "" && sessionKey != newKey { delete(c.chatStore, sessionKey) }
+        c.chatStore[newKey] = chat
+        c.chatMutex.Unlock()
     }
 
     if translator.NeedConvert(handlerType, c.Type()) {
@@ -297,15 +379,71 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
 
         cleaned := sanitizeAssistantMessages(messages)
         meta, reuseIdx := c.findReusableMetadata(modelName, cleaned)
-        useTags := needRoleTags(messages)
-        if reuseIdx > 0 && len(messages[reuseIdx:]) == 1 && strings.ToLower(messages[reuseIdx].Role) == "user" {
-            useTags = false
+        // Only send newest user message in streaming path
+        explicitContext := false
+        var prompt string
+        for i := len(messages) - 1; i >= 0; i-- {
+            if strings.ToLower(messages[i].Role) == "user" { prompt = messages[i].Text; break }
         }
-        prompt := buildPrompt(messages[reuseIdx:], useTags, useTags)
+        if prompt == "" {
+            errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: errors.New("bad request: no user message found at the end of conversation")}
+            return
+        }
+
+        // For request logging: append upstream prompt/decision details into API_REQUEST (streaming)
+        if c.cfg.RequestLog {
+            if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
+                var sb strings.Builder
+                sb.WriteString("\n\n--- GEMINI WEB UPSTREAM DEBUG ---\n")
+                sb.WriteString(fmt.Sprintf("account: %s\n", c.GetEmail()))
+                sb.WriteString(fmt.Sprintf("reuseIdx: %d\n", reuseIdx))
+                sb.WriteString(fmt.Sprintf("useTags: %t\n", false))
+                sb.WriteString(fmt.Sprintf("metadata_len: %d\n", len(meta)))
+                if explicitContext { sb.WriteString("explicit_context: true\n") } else { sb.WriteString("explicit_context: false\n") }
+                if l := len(uploadedFiles); l > 0 { sb.WriteString(fmt.Sprintf("files: %d\n", l)) }
+                chunks := chunkByRunes(prompt, 4096)
+                preview := prompt
+                truncated := false
+                if len(chunks) > 1 {
+                    preview = chunks[0]
+                    truncated = true
+                }
+                sb.WriteString("prompt_preview:\n")
+                sb.WriteString(preview)
+                if truncated { sb.WriteString("\n... [truncated]\n") }
+
+                if existing, exists := ginContext.Get("API_REQUEST"); exists {
+                    if base, ok2 := existing.([]byte); ok2 {
+                        merged := append(append([]byte{}, base...), []byte(sb.String())...)
+                        ginContext.Set("API_REQUEST", merged)
+                    }
+                }
+            }
+        }
 
         log.Debugf("Use Gemini Web account %s for model %s", c.GetEmail(), modelName)
-        // Single request; session metadata handles multi-turn
-        output, genErr := c.generateWithChat(ctx, modelName, prompt, meta, uploadedFiles...)
+        // Resolve or initialize chat session and send only current turn
+        var chat *gemweb.ChatSession
+        var sessionKey string
+        if reuseIdx > 0 && len(meta) > 0 {
+            prefix := make([]roleText, reuseIdx)
+            copy(prefix, cleaned[:reuseIdx])
+            sessionKey = c.conversationKey(modelName, prefix)
+            c.chatMutex.RLock(); chat = c.chatStore[sessionKey]; c.chatMutex.RUnlock()
+            if chat == nil {
+                underlying := mapAliasToUnderlying(modelName)
+                model, err := gemweb.ModelFromName(underlying)
+                if err != nil { errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: err}; return }
+                chat = c.gwc.StartChat(model, nil, meta)
+                c.chatMutex.Lock(); c.chatStore[sessionKey] = chat; c.chatMutex.Unlock()
+            }
+        } else {
+            underlying := mapAliasToUnderlying(modelName)
+            model, err := gemweb.ModelFromName(underlying)
+            if err != nil { errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: err}; return }
+            chat = c.gwc.StartChat(model, nil, nil)
+        }
+        out, genErr := chat.SendMessage(prompt, uploadedFiles)
         if genErr != nil {
             status := 500
             switch {
@@ -328,11 +466,18 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
         c.ClearModelQuotaExceeded(modelName)
 
         // Build one final Gemini-shaped response and stream it as a single event
-        gemBytes, errMsg := c.convertOutputToGemini(output, modelName)
+        gemBytes, errMsg := c.convertOutputToGemini(&out, modelName)
         if errMsg != nil { errChan <- errMsg; return }
         c.AddAPIResponseData(ctx, gemBytes)
-        if output != nil && len(output.Metadata) > 0 && len(output.Candidates) > 0 {
-            c.storeConversation(modelName, cleaned, output.Candidates[0].Text, output.Metadata)
+        if len(out.Metadata) > 0 && len(out.Candidates) > 0 {
+            c.storeConversation(modelName, cleaned, out.Candidates[0].Text, out.Metadata)
+            // Update chat cache key to include latest assistant
+            newPrefix := append(append([]roleText{}, cleaned...), roleText{Role: "assistant", Text: removeThinkTags(out.Candidates[0].Text)})
+            newKey := c.conversationKey(modelName, newPrefix)
+            c.chatMutex.Lock()
+            if sessionKey != "" && sessionKey != newKey { delete(c.chatStore, sessionKey) }
+            c.chatStore[newKey] = chat
+            c.chatMutex.Unlock()
         }
         if translator.NeedConvert(handlerType, c.Type()) && handlerType != GEMINI {
             var param any
@@ -460,7 +605,7 @@ func simulateGeminiStreaming(out chan<- []byte, modelName string, output *gemweb
 func buildGeminiImageChunk(modelName, mimeType, base64Data string) []byte {
     part := map[string]any{
         "inlineData": map[string]any{
-            "mime_type": mimeType,
+            "mimeType":  mimeType,
             "data":      base64Data,
         },
     }
@@ -710,7 +855,7 @@ func (c *GeminiWebClient) convStorePath() string {
     if err != nil || wd == "" {
         wd = "."
     }
-    convDir := filepath.Join(wd, "conv")
+    convDir := filepath.Join(wd, "logs", "conv")
     base := strings.TrimSuffix(filepath.Base(c.tokenFilePath), filepath.Ext(c.tokenFilePath))
     return filepath.Join(convDir, base+".conv.json")
 }
@@ -825,7 +970,7 @@ func (c *GeminiWebClient) parseMessagesAndFiles(rawJSON []byte) ([]roleText, [][
     contents := gjson.GetBytes(rawJSON, "contents")
     if contents.Exists() {
         contents.ForEach(func(_, content gjson.Result) bool {
-            role := strings.ToLower(content.Get("role").String())
+            role := normalizeRole(content.Get("role").String())
             var b strings.Builder
             content.Get("parts").ForEach(func(_, part gjson.Result) bool {
                 if text := part.Get("text"); text.Exists() {
@@ -839,7 +984,11 @@ func (c *GeminiWebClient) parseMessagesAndFiles(rawJSON []byte) ([]roleText, [][
                     if data != "" {
                         if dec, err := base64.StdEncoding.DecodeString(data); err == nil {
                             files = append(files, dec)
-                            m := inlineData.Get("mime_type").String()
+                            // Accept both "mimeType" (Gemini API) and legacy "mime_type"
+                            m := inlineData.Get("mimeType").String()
+                            if m == "" {
+                                m = inlineData.Get("mime_type").String()
+                            }
                             mimes = append(mimes, m)
                         }
                     }
@@ -922,10 +1071,11 @@ func (c *GeminiWebClient) conversationKey(modelName string, msgs []roleText) str
     norm := make([]map[string]string, 0, len(msgs))
     for _, m := range msgs {
         t := m.Text
-        if strings.ToLower(m.Role) == "assistant" {
+        r := normalizeRole(m.Role)
+        if r == "assistant" {
             t = removeThinkTags(t)
         }
-        norm = append(norm, map[string]string{"r": strings.ToLower(m.Role), "t": t})
+        norm = append(norm, map[string]string{"r": r, "t": t})
     }
     b, _ := json.Marshal(norm)
     sum := sha256.Sum256(b)
@@ -1074,7 +1224,7 @@ func (c *GeminiWebClient) convertOutputToGemini(output *gemweb.ModelOutput, mode
             if mime, data, err := fetchGeneratedImageData(gi); err == nil && data != "" {
                 parts = append(parts, map[string]any{
                     "inlineData": map[string]any{
-                        "mime_type": mime,
+                        "mimeType":  mime,
                         "data":      data,
                     },
                 })
