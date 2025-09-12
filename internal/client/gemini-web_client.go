@@ -207,6 +207,8 @@ func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, 
 	}
 
     // Parse messages and inline files (if any)
+    // - Exclude system prompts from context
+    // - Exclude any thought/reasoning parts from context
     messages, files, mimes, err := c.parseMessagesAndFiles(rawJSON)
     if err != nil {
         return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
@@ -217,22 +219,13 @@ func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, 
         return nil, upErr
     }
 
-    // Conversation reuse: try to find prior metadata by history prefix ending with assistant/system
+    // Build explicit-context prompt (no system, no thoughts), not relying on built-in multi-turn history
     cleaned := sanitizeAssistantMessages(messages)
-    meta, reuseIdx := c.findReusableMetadata(modelName, cleaned)
-
-    // Only send the current turn's new user message as prompt
-    useTags := false
-    explicitContext := false
-    var prompt string
-    for i := len(messages) - 1; i >= 0; i-- {
-        if strings.ToLower(messages[i].Role) == "user" {
-            prompt = messages[i].Text
-            break
-        }
-    }
-    if prompt == "" {
-        return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: errors.New("bad request: no user message found at the end of conversation")}
+    useTags := needRoleTags(cleaned)
+    explicitContext := true
+    prompt := buildPrompt(cleaned, useTags, false)
+    if strings.TrimSpace(prompt) == "" {
+        return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: errors.New("bad request: empty prompt after filtering system/thought content")}
     }
 
     // For request logging: append upstream prompt/decision details into API_REQUEST
@@ -241,9 +234,10 @@ func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, 
             var sb strings.Builder
             sb.WriteString("\n\n--- GEMINI WEB UPSTREAM DEBUG ---\n")
             sb.WriteString(fmt.Sprintf("account: %s\n", c.GetEmail()))
-            sb.WriteString(fmt.Sprintf("reuseIdx: %d\n", reuseIdx))
+            // Account-level session reuse; context is embedded in prompt
+            sb.WriteString("reuseIdx: 0\n")
             sb.WriteString(fmt.Sprintf("useTags: %t\n", useTags))
-            sb.WriteString(fmt.Sprintf("metadata_len: %d\n", len(meta)))
+            sb.WriteString("metadata_len: 0\n")
             if explicitContext { sb.WriteString("explicit_context: true\n") } else { sb.WriteString("explicit_context: false\n") }
             if l := len(uploadedFiles); l > 0 { sb.WriteString(fmt.Sprintf("files: %d\n", l)) }
             // Truncate prompt preview to a safe size (rune-aware)
@@ -267,28 +261,18 @@ func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, 
         }
     }
 
-    // Resolve or initialize chat session for this conversation prefix
+    // Resolve or initialize a single reusable chat session per account+model
     var chat *gemweb.ChatSession
-    var sessionKey string
-    if reuseIdx > 0 && len(meta) > 0 {
-        prefix := make([]roleText, reuseIdx)
-        copy(prefix, cleaned[:reuseIdx])
-        sessionKey = c.conversationKey(modelName, prefix)
-        c.chatMutex.RLock()
-        chat = c.chatStore[sessionKey]
-        c.chatMutex.RUnlock()
-        if chat == nil {
-            underlying := mapAliasToUnderlying(modelName)
-            model, err := gemweb.ModelFromName(underlying)
-            if err != nil { return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: err} }
-            chat = c.gwc.StartChat(model, nil, meta)
-            c.chatMutex.Lock(); c.chatStore[sessionKey] = chat; c.chatMutex.Unlock()
-        }
-    } else {
+    sessionKey := c.accountSessionKey(modelName)
+    c.chatMutex.RLock()
+    chat = c.chatStore[sessionKey]
+    c.chatMutex.RUnlock()
+    if chat == nil {
         underlying := mapAliasToUnderlying(modelName)
         model, err := gemweb.ModelFromName(underlying)
         if err != nil { return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: err} }
         chat = c.gwc.StartChat(model, nil, nil)
+        c.chatMutex.Lock(); c.chatStore[sessionKey] = chat; c.chatMutex.Unlock()
     }
 
     log.Debugf("Use Gemini Web account %s for model %s", c.GetEmail(), modelName)
@@ -321,16 +305,7 @@ func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, 
     // Log the constructed upstream-like response for request logger
     c.AddAPIResponseData(ctx, gemBytes)
 
-    // Store refreshed conversation metadata for future reuse and update chat cache key
-    if output != nil && len(output.Metadata) > 0 && len(output.Candidates) > 0 {
-        c.storeConversation(modelName, cleaned, output.Candidates[0].Text, output.Metadata)
-        newPrefix := append(append([]roleText{}, cleaned...), roleText{Role: "assistant", Text: removeThinkTags(output.Candidates[0].Text)})
-        newKey := c.conversationKey(modelName, newPrefix)
-        c.chatMutex.Lock()
-        if sessionKey != "" && sessionKey != newKey { delete(c.chatStore, sessionKey) }
-        c.chatStore[newKey] = chat
-        c.chatMutex.Unlock()
-    }
+    // We no longer track per-conversation metadata; always reuse the account-level session
 
     if translator.NeedConvert(handlerType, c.Type()) {
         var param any
@@ -366,6 +341,7 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
 		}
 
         // Build messages and upload inline files if any
+        // - Exclude system prompts and thought/reasoning parts from context
         messages, files, mimes, err := c.parseMessagesAndFiles(rawJSON)
         if err != nil {
             errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
@@ -378,15 +354,12 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
         }
 
         cleaned := sanitizeAssistantMessages(messages)
-        meta, reuseIdx := c.findReusableMetadata(modelName, cleaned)
-        // Only send newest user message in streaming path
-        explicitContext := false
-        var prompt string
-        for i := len(messages) - 1; i >= 0; i-- {
-            if strings.ToLower(messages[i].Role) == "user" { prompt = messages[i].Text; break }
-        }
-        if prompt == "" {
-            errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: errors.New("bad request: no user message found at the end of conversation")}
+        // Build explicit-context prompt (no system, no thoughts)
+        explicitContext := true
+        useTags := needRoleTags(cleaned)
+        prompt := buildPrompt(cleaned, useTags, false)
+        if strings.TrimSpace(prompt) == "" {
+            errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: errors.New("bad request: empty prompt after filtering system/thought content")}
             return
         }
 
@@ -396,9 +369,9 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
                 var sb strings.Builder
                 sb.WriteString("\n\n--- GEMINI WEB UPSTREAM DEBUG ---\n")
                 sb.WriteString(fmt.Sprintf("account: %s\n", c.GetEmail()))
-                sb.WriteString(fmt.Sprintf("reuseIdx: %d\n", reuseIdx))
-                sb.WriteString(fmt.Sprintf("useTags: %t\n", false))
-                sb.WriteString(fmt.Sprintf("metadata_len: %d\n", len(meta)))
+                sb.WriteString("reuseIdx: 0\n")
+                sb.WriteString(fmt.Sprintf("useTags: %t\n", useTags))
+                sb.WriteString("metadata_len: 0\n")
                 if explicitContext { sb.WriteString("explicit_context: true\n") } else { sb.WriteString("explicit_context: false\n") }
                 if l := len(uploadedFiles); l > 0 { sb.WriteString(fmt.Sprintf("files: %d\n", l)) }
                 chunks := chunkByRunes(prompt, 4096)
@@ -422,26 +395,16 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
         }
 
         log.Debugf("Use Gemini Web account %s for model %s", c.GetEmail(), modelName)
-        // Resolve or initialize chat session and send only current turn
+        // Resolve or initialize a single reusable chat session per account+model
         var chat *gemweb.ChatSession
-        var sessionKey string
-        if reuseIdx > 0 && len(meta) > 0 {
-            prefix := make([]roleText, reuseIdx)
-            copy(prefix, cleaned[:reuseIdx])
-            sessionKey = c.conversationKey(modelName, prefix)
-            c.chatMutex.RLock(); chat = c.chatStore[sessionKey]; c.chatMutex.RUnlock()
-            if chat == nil {
-                underlying := mapAliasToUnderlying(modelName)
-                model, err := gemweb.ModelFromName(underlying)
-                if err != nil { errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: err}; return }
-                chat = c.gwc.StartChat(model, nil, meta)
-                c.chatMutex.Lock(); c.chatStore[sessionKey] = chat; c.chatMutex.Unlock()
-            }
-        } else {
+        sessionKey := c.accountSessionKey(modelName)
+        c.chatMutex.RLock(); chat = c.chatStore[sessionKey]; c.chatMutex.RUnlock()
+        if chat == nil {
             underlying := mapAliasToUnderlying(modelName)
             model, err := gemweb.ModelFromName(underlying)
             if err != nil { errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: err}; return }
             chat = c.gwc.StartChat(model, nil, nil)
+            c.chatMutex.Lock(); c.chatStore[sessionKey] = chat; c.chatMutex.Unlock()
         }
         out, genErr := chat.SendMessage(prompt, uploadedFiles)
         if genErr != nil {
@@ -469,16 +432,7 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
         gemBytes, errMsg := c.convertOutputToGemini(&out, modelName)
         if errMsg != nil { errChan <- errMsg; return }
         c.AddAPIResponseData(ctx, gemBytes)
-        if len(out.Metadata) > 0 && len(out.Candidates) > 0 {
-            c.storeConversation(modelName, cleaned, out.Candidates[0].Text, out.Metadata)
-            // Update chat cache key to include latest assistant
-            newPrefix := append(append([]roleText{}, cleaned...), roleText{Role: "assistant", Text: removeThinkTags(out.Candidates[0].Text)})
-            newKey := c.conversationKey(modelName, newPrefix)
-            c.chatMutex.Lock()
-            if sessionKey != "" && sessionKey != newKey { delete(c.chatStore, sessionKey) }
-            c.chatStore[newKey] = chat
-            c.chatMutex.Unlock()
-        }
+        // Always reuse account-level session; no per-conversation metadata tracking
         if translator.NeedConvert(handlerType, c.Type()) && handlerType != GEMINI {
             var param any
             lines := translator.Response(handlerType, c.Type(), ctx, modelName, originalRequestRawJSON, rawJSON, gemBytes, &param)
@@ -971,9 +925,17 @@ func (c *GeminiWebClient) parseMessagesAndFiles(rawJSON []byte) ([]roleText, [][
     if contents.Exists() {
         contents.ForEach(func(_, content gjson.Result) bool {
             role := normalizeRole(content.Get("role").String())
+            // Skip system messages entirely per requirements
+            if role == "system" {
+                return true
+            }
             var b strings.Builder
             content.Get("parts").ForEach(func(_, part gjson.Result) bool {
                 if text := part.Get("text"); text.Exists() {
+                    // Skip thought/reasoning parts from context
+                    if part.Get("thought").Bool() {
+                        return true
+                    }
                     if b.Len() > 0 {
                         b.WriteString("\n")
                     }
@@ -1122,6 +1084,12 @@ func (c *GeminiWebClient) generateWithChat(ctx context.Context, modelName, promp
     out, err := c.generateContent(ctx, model, prompt, chat, files...)
     if err != nil { return nil, err }
     return out, nil
+}
+
+// accountSessionKey returns a stable key for the reusable per-account session.
+// We scope it by model to avoid mixing different underlying models within one chat session.
+func (c *GeminiWebClient) accountSessionKey(modelName string) string {
+    return fmt.Sprintf("account|%s|%s", c.GetEmail(), modelName)
 }
 
 // materializeInlineFiles writes inline file bytes to temporary files and returns their paths.
