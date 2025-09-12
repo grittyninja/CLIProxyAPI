@@ -76,6 +76,26 @@ type GeminiWebClient struct {
     cookiePersistCancel   context.CancelFunc
 }
 
+// UnregisterClient overrides ClientBase.UnregisterClient to ensure any
+// background goroutines (cookie persistence and web client's auto-refresh)
+// are stopped before removing the client from the registry. This prevents
+// multiple stale goroutines from continuing to write rotated cookies to
+// the same auth file which can cause excessive file watcher churn.
+func (c *GeminiWebClient) UnregisterClient() {
+    // Stop cookie persistence loop if running
+    if c.cookiePersistCancel != nil {
+        c.cookiePersistCancel()
+        c.cookiePersistCancel = nil
+    }
+    // Close underlying web client to stop its auto-refresh ticker
+    if c.gwc != nil {
+        c.gwc.Close(0)
+        c.gwc = nil
+    }
+    // Remove from model registry via base implementation
+    c.ClientBase.UnregisterClient()
+}
+
 func NewGeminiWebClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, tokenFilePath string) (*GeminiWebClient, error) {
     // Build a minimal HTTP client (only for logging utilities). The core API
     // requests will go through geminiwebapi client which manages its own client.
